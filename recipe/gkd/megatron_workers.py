@@ -27,7 +27,9 @@ from megatron.core import parallel_state as mpu
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.pipeline_parallel import get_forward_backward_func
-from megatron_kl_loss import vocab_parallel_kl_divergence
+# from megatron_kl_loss import vocab_parallel_kl_divergence
+# BUG: path issue
+from .megatron_kl_loss import vocab_parallel_kl_divergence
 from omegaconf import DictConfig, OmegaConf
 from torch import nn
 
@@ -457,8 +459,8 @@ class MegatronOnPolicyDistillActorWorker(ActorRolloutRefWorker):
         if self.bridge is not None:
             generator = self.bridge.export_weights(self.actor.actor_module)
         else:
-            # from verl.utils.megatron_utils import per_tensor_generator
-            from megatron_utils import per_tensor_generator
+            from verl.utils.megatron_utils import per_tensor_generator
+            # from megatron_utils import per_tensor_generator
 
             from verl.models.mcore import get_mcore_weight_converter
 
@@ -757,7 +759,27 @@ class MegatronOnPolicyDistillRolloutWorker(ActorRolloutRefWorker):
         assert self._is_rollout and not self.config.hybrid_engine
         assert hasattr(self, "_weights_info") and self._weights_info is not None
         rollout_name = self.config.rollout.name
+        print("=== DEBUG sync_rollout_weights ===")
+        print("rollout_name:", rollout_name)
+        print("self.rollout is None?", self.rollout is None)
+        if self.rollout is not None:
+            print("rollout type:", type(self.rollout))
+            print("has inference_engine?", hasattr(self.rollout, "inference_engine"))
+            print("inference_engine:", getattr(self.rollout, "inference_engine", None))
+            ie = getattr(self.rollout, "inference_engine", None)
+            if ie is not None:
+                print("has llm_engine?", hasattr(ie, "llm_engine"))
+                print("llm_engine:", getattr(ie, "llm_engine", None))
+
         if rollout_name == "vllm":
+            if getattr(self.rollout, "inference_engine", None) is None:
+                logger.warning("[sync_rollout_weights] vLLM inference_engine not ready; will retry later")
+                self._need_rollout_sync = True
+                return
+            # engine ready
+            if getattr(self, "_need_rollout_sync", False):
+                logger.info("[sync_rollout_weights] vLLM engine ready now; performing delayed first sync")
+                self._need_rollout_sync = False
             inference_model = (
                 self.rollout.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
             )

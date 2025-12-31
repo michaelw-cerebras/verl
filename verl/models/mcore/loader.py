@@ -402,8 +402,13 @@ def load_state_dict_to_megatron_gptmodel(state_dict, wrapped_models, config, par
             gpt_model_module = _get_gpt_model(models[dst_virtual_pp_rank])
             sync_layer = gpt_model_module.decoder.layers[dst_layer_idx]
 
+            # NOTE: manual disable TE
+            # _broadcast_tensor(
+            #     sync_layer.self_attention.linear_qkv.layer_norm_weight if dst_pp_rank == pp_rank else None,
+            #     f"{layer_name}.input_layernorm.weight",
+            # )
             _broadcast_tensor(
-                sync_layer.self_attention.linear_qkv.layer_norm_weight if dst_pp_rank == pp_rank else None,
+                _get_input_ln_weight(sync_layer) if dst_pp_rank == pp_rank else None,
                 f"{layer_name}.input_layernorm.weight",
             )
 
@@ -437,10 +442,18 @@ def load_state_dict_to_megatron_gptmodel(state_dict, wrapped_models, config, par
                 f"{layer_name}.self_attn.o_proj.weight",
                 chunk_dim=1,
             )
+
+            # NOTE: manual disable TE
+            # _broadcast_tensor(
+            #     sync_layer.mlp.linear_fc1.layer_norm_weight if dst_pp_rank == pp_rank else None,
+            #     f"{layer_name}.post_attention_layernorm.weight",
+            # )
             _broadcast_tensor(
-                sync_layer.mlp.linear_fc1.layer_norm_weight if dst_pp_rank == pp_rank else None,
+                _get_post_attn_ln_weight(sync_layer) if dst_pp_rank == pp_rank else None,
                 f"{layer_name}.post_attention_layernorm.weight",
             )
+
+
 
             _broadcast_tp_shard_tensor_gate_up(
                 sync_layer.mlp.linear_fc1.weight if dst_pp_rank == pp_rank else None,
@@ -493,3 +506,30 @@ def load_state_dict_to_megatron_gptmodel(state_dict, wrapped_models, config, par
     pass
     get_torch_device().empty_cache()
     print_rank_0(f"loading megatron ckpt done, time elapsed {time.time() - start_time}s")
+
+
+# NOTE: workarounds to disable TE usage
+def _maybe_get_fused_ln_weight(mod):
+    # TE 的 LayerNormLinear / fused module 才有这个字段
+    return getattr(mod, "layer_norm_weight", None)
+
+def _get_input_ln_weight(sync_layer):
+    # 1) TE fused: self_attention.linear_qkv.layer_norm_weight
+    w = _maybe_get_fused_ln_weight(getattr(sync_layer.self_attention, "linear_qkv", None))
+    if w is not None:
+        return w
+    # 2) 非 TE：通常是 sync_layer.input_layernorm.weight
+    ln = getattr(sync_layer, "input_layernorm", None)
+    return getattr(ln, "weight", None)
+
+def _get_post_attn_ln_weight(sync_layer):
+    # 1) TE fused: mlp.linear_fc1.layer_norm_weight
+    w = _maybe_get_fused_ln_weight(getattr(sync_layer.mlp, "linear_fc1", None))
+    if w is not None:
+        return w
+    # 2) 非 TE：通常是 sync_layer.post_attention_layernorm.weight
+    ln = getattr(sync_layer, "post_attention_layernorm", None)
+    # 有些实现叫 pre_mlp_layernorm（保险起见加 fallback）
+    if ln is None:
+        ln = getattr(sync_layer, "pre_mlp_layernorm", None)
+    return getattr(ln, "weight", None)
