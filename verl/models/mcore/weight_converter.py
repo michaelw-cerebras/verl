@@ -91,6 +91,22 @@ class McoreToHFWeightConverterDense(McoreToHFWeightConverterBase):
         }
         if name in direct_name_mapping:
             return [direct_name_mapping[name]], [params_one_group[0]]
+        
+        import re
+        # ---- ADD THIS: layernorm/rmsnorm mapping ----
+        # Handle Megatron(mcore) decoder.* -> HF model.*
+        # Examples:
+        #   decoder.layers.0.input_layernorm.weight -> model.layers.0.input_layernorm.weight
+        #   decoder.layers.0.post_attention_layernorm.weight -> model.layers.0.post_attention_layernorm.weight
+        m = re.match(r"^decoder\.layers\.(\d+)\.([a-zA-Z0-9_]*layernorm)\.(weight|bias)$", name)
+        if m:
+            layer_id, norm_kind, wb = m.groups()
+            return [f"model.layers.{layer_id}.{norm_kind}.{wb}"], [params_one_group[0]]
+
+        m2 = re.match(r"^model\.layers\.(\d+)\.([a-zA-Z0-9_]*layernorm)\.(weight|bias)$", name)
+        if m2:
+            return [name], [params_one_group[0]]
+        # --------------------------------------------
 
         if "self_attention" in name:
             return self._convert_attention_param(name, params_one_group)
