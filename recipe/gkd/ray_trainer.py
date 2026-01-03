@@ -28,6 +28,8 @@ from omegaconf import OmegaConf, open_dict
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
+from collections import defaultdict
+import uuid
 
 from recipe.gkd.teacher import TeacherClient
 from recipe.gkd.teacher_utils import get_teacher_knowledge
@@ -47,6 +49,9 @@ from verl.utils.metric import (
 )
 from verl.utils.torch_dtypes import PrecisionType
 from verl.utils.tracking import ValidationGenerationsLogger
+
+from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+
 
 WorkerType = type[Worker]
 
@@ -124,6 +129,9 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
         role_worker_mapping: dict[Role, WorkerType],
         resource_pool_manager: ResourcePoolManager,
         ray_worker_group_cls: RayWorkerGroup = RayWorkerGroup,
+        processor=None,
+        reward_fn=None,
+        val_reward_fn=None,
         train_dataset: Optional[Dataset] = None,
         val_dataset: Optional[Dataset] = None,
         collate_fn=None,
@@ -153,6 +161,10 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
         # Store the tokenizer for text processing
         self.tokenizer = tokenizer
         self.config = config
+
+        # [Claude]
+        self.reward_fn = reward_fn
+        self.val_reward_fn = val_reward_fn
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert not self.hybrid_engine
@@ -553,6 +565,16 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
         # load checkpoint before doing anything
         self._load_checkpoint()
 
+        # ============ [Claude] ADD VALIDATION BEFORE TRAINING ============
+        # Perform validation before training (same as PPO)
+        if hasattr(self, 'val_reward_fn') and self.val_reward_fn is not None:
+            if self.config.trainer.get("val_before_train", True):
+                val_metrics = self._validate()
+                if val_metrics:
+                    print(f"Initial validation metrics: {val_metrics}")
+                    logger.log(data=val_metrics, step=self.global_steps)
+        # =========================================================
+
         # add tqdm
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
 
@@ -665,6 +687,19 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
                     with marked_timer("save_checkpoint", timing_raw, color="green"):
                         self._save_checkpoint()
 
+                # ============ [Claude] ADD PERIODIC VALIDATION ============
+                # Validate periodically (same as PPO)
+                if hasattr(self, 'val_reward_fn') and self.val_reward_fn is not None:
+                    if self.config.trainer.test_freq > 0 and (
+                        is_last_step or self.global_steps % self.config.trainer.test_freq == 0
+                    ):
+                        with marked_timer("testing", timing_raw, color="green"):
+                            val_metrics = self._validate()
+                        if val_metrics:
+                            metrics.update(val_metrics)
+                # =================================================
+
+
             # Metrics and bookkeeping
             steps_duration = timing_raw["step"]
             max_steps_duration = max(max_steps_duration, steps_duration)
@@ -694,3 +729,208 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
             if is_last_step:
                 progress_bar.close()
                 return
+            
+    
+    # [Claude] Add new validate function
+    def _validate(self):
+        """Validate the model on validation dataset (rule-based RM).
+
+        Key fixes vs current version:
+        - sync rollout weights BEFORE any generation (rollout worker holds its own model copy)
+        - align with PPO validate: repeat val batch, pad/unpad, val_kwargs.do_sample
+        - avoid mutating the reward batch via _get_gen_batch() (which pops tensor keys)
+        """
+        if not hasattr(self, "val_dataloader") or self.val_dataloader is None:
+            print("No validation dataset available, skipping validation")
+            return {}
+
+        if not hasattr(self, "val_reward_fn") or self.val_reward_fn is None:
+            print("No val_reward_fn provided, skipping validation")
+            return {}
+
+        # 🔥 CRITICAL: rollout engine is a separate model instance; sync weights before generating
+        if not self.hybrid_engine:
+            self.sync_rollout_weights()
+
+        data_source_lst = []
+        reward_extra_infos_dict: dict[str, list] = defaultdict(list)
+
+        # Lists to collect samples for the table
+        sample_inputs = []
+        sample_outputs = []
+        sample_gts = []
+        sample_scores = []
+        sample_uids = []
+
+        # PPO-style validation kwargs
+        val_kwargs = self.config.actor_rollout_ref.rollout.val_kwargs
+        repeat_n = int(getattr(val_kwargs, "n", 1))
+        do_sample = bool(getattr(val_kwargs, "do_sample", False))
+
+        for test_data in self.val_dataloader:
+            # Keep a pristine batch for reward computation / logging
+            reward_batch = DataProto.from_single_dict(test_data)
+
+            if "uid" not in reward_batch.non_tensor_batch:
+                reward_batch.non_tensor_batch["uid"] = np.array(
+                    [str(uuid.uuid4()) for _ in range(len(reward_batch.batch))], dtype=object
+                )
+
+            # Build a separate batch for generation because _get_gen_batch() pops tensor keys
+            rollout_batch = DataProto.from_single_dict(test_data)
+            rollout_batch.non_tensor_batch["uid"] = reward_batch.non_tensor_batch["uid"]
+
+            # repeat test batch (for best@k/maj@k etc.)
+            if repeat_n > 1:
+                reward_batch = reward_batch.repeat(repeat_times=repeat_n, interleave=True)
+                rollout_batch = rollout_batch.repeat(repeat_times=repeat_n, interleave=True)
+
+            # we only do validation on rule-based rm (same guard as PPO)
+            try:
+                if (
+                    getattr(self.config, "reward_model", None) is not None
+                    and self.config.reward_model.enable
+                    and reward_batch[0].non_tensor_batch["reward_model"]["style"] == "model"
+                ):
+                    return {}
+            except Exception:
+                pass
+
+            # Store original inputs and ground truths
+            input_ids = reward_batch.batch["input_ids"]
+            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+            sample_inputs.extend(input_texts)
+            sample_uids.extend(reward_batch.non_tensor_batch["uid"])
+
+            ground_truths = [
+                item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in reward_batch
+            ]
+            sample_gts.extend(ground_truths)
+
+            # Prepare generation batch (PPO-style)
+            gen_batch = self._get_gen_batch(rollout_batch)
+            gen_batch.meta_info = {
+                "eos_token_id": self.tokenizer.eos_token_id,
+                "pad_token_id": self.tokenizer.pad_token_id,
+                "recompute_log_prob": False,
+                "do_sample": do_sample,
+                "validate": True,
+                "global_steps": self.global_steps,
+            }
+
+            # pad to be divisible by rollout dp size (safe fallback to 1)
+            size_divisor = getattr(self.rollout_wg, "world_size", 1) or 1
+            gen_batch_padded, pad_size = pad_dataproto_to_divisor(gen_batch, size_divisor)
+
+            # Generate sequences using rollout worker
+            output_gen_batch_padded = self.rollout_wg.generate_sequences(gen_batch_padded)
+            output_gen_batch = unpad_dataproto(output_gen_batch_padded, pad_size=pad_size)
+
+            # Store outputs
+            output_ids = output_gen_batch.batch["responses"]
+            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+            sample_outputs.extend(output_texts)
+
+            # validate-only: avoid union() asserting on duplicated prompt tensors
+            for k in ("input_ids", "attention_mask", "position_ids"):
+                if k in output_gen_batch.batch:
+                    output_gen_batch.batch.pop(k)
+            # Merge batches (use reward_batch so we keep original tensors)
+            reward_batch = reward_batch.union(output_gen_batch)
+            reward_batch.meta_info["validate"] = True
+
+            # Compute rewards
+            result = self.val_reward_fn(reward_batch, return_dict=True)
+            reward_tensor = result["reward_tensor"]
+            scores = reward_tensor.sum(-1).cpu().tolist()
+
+            sample_scores.extend(scores)
+            reward_extra_infos_dict["reward"].extend(scores)
+
+            if "reward_extra_info" in result:
+                for key, lst in result["reward_extra_info"].items():
+                    reward_extra_infos_dict[key].extend(lst)
+
+            data_source_lst.append(reward_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
+
+        # log generations table
+        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+
+        # dump generations
+        val_data_dir = self.config.trainer.get("validation_data_dir", None)
+        if val_data_dir:
+            self._dump_generations(
+                inputs=sample_inputs,
+                outputs=sample_outputs,
+                gts=sample_gts,
+                scores=sample_scores,
+                reward_extra_infos_dict=reward_extra_infos_dict,
+                dump_path=val_data_dir,
+            )
+
+        for key_info, lst in reward_extra_infos_dict.items():
+            assert len(lst) == 0 or len(lst) == len(sample_scores), (
+                f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
+            )
+
+        data_sources = np.concatenate(data_source_lst, axis=0)
+
+        from verl.trainer.ppo.metric_utils import process_validation_metrics
+
+        data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
+
+        metric_dict = {}
+        for data_source, var2metric2val in data_src2var2metric2val.items():
+            core_var = "acc" if "acc" in var2metric2val else "reward"
+            for var_name, metric2val in var2metric2val.items():
+                n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
+                for metric_name, metric_val in metric2val.items():
+                    if (
+                        (var_name == core_var)
+                        and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"])
+                        and (f"@{n_max}" in metric_name)
+                    ):
+                        metric_sec = "val-core"
+                    else:
+                        metric_sec = "val-aux"
+                    pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
+                    metric_dict[pfx] = metric_val
+
+        return metric_dict
+    
+    def _get_gen_batch(self, batch: DataProto) -> DataProto:
+        """
+        Build a generation-only DataProto WITHOUT mutating the input batch.
+
+        Why:
+        - batch.pop(...) mutates `batch.batch` in-place, deleting input_ids/attn/pos.
+        - That can silently break reward/metrics/logging/dump paths that assume these exist.
+        """
+        gen_dict = {}
+
+        # tensor keys needed by rollout
+        for k in ["input_ids", "attention_mask", "position_ids"]:
+            if k in batch.batch:
+                gen_dict[k] = batch.batch[k]
+
+        # non-tensor keys needed by rollout (agent/tool/MM)
+        for k in [
+            "raw_prompt_ids",
+            "raw_prompt",
+            "multi_modal_data",
+            "tools_kwargs",
+            "interaction_kwargs",
+        ]:
+            if k in batch.non_tensor_batch:
+                gen_dict[k] = batch.non_tensor_batch[k]
+
+        # optional: keep uid if you want easier tracing (harmless)
+        if "uid" in batch.non_tensor_batch:
+            gen_dict["uid"] = batch.non_tensor_batch["uid"]
+
+        return DataProto.from_single_dict(gen_dict)
+
+
+
+
+            

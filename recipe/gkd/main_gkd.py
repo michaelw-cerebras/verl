@@ -24,6 +24,7 @@ import ray
 from omegaconf import OmegaConf
 
 from recipe.gkd.ray_trainer import OnPolicyDistillTrainer
+from verl.trainer.ppo.reward import load_reward_manager
 
 RAY_RUNTIME_ENV = {
     "env_vars": {
@@ -137,6 +138,19 @@ class TaskRunner:
         trust_remote_code = config.data.get("trust_remote_code", False)
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
 
+        # ============ [Claude] ADD THESE LINES ============
+        # Load the reward manager for validation (same as PPO)
+        # Only create reward functions if reward_model is configured
+        reward_fn = load_reward_manager(
+            config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
+        )
+        val_reward_fn = load_reward_manager(
+            config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {})
+        )
+        print("Loaded reward functions for validation")
+        # =========================================
+
+
         # Version validation for vllm.
         if config.actor_rollout_ref.rollout.name in ["vllm"]:
             from verl.utils.vllm import is_version_ge
@@ -212,6 +226,8 @@ class TaskRunner:
             role_worker_mapping=role_worker_mapping,
             resource_pool_manager=resource_pool_manager,
             ray_worker_group_cls=ray_worker_group_cls,
+            reward_fn=reward_fn,          # [Claude]
+            val_reward_fn=val_reward_fn,  # [Claude]
             train_dataset=train_dataset,
             val_dataset=val_dataset,
             collate_fn=collate_fn,

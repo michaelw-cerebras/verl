@@ -447,6 +447,29 @@ def _load_hf_model(config, model_config, is_value_model):
             )
             state_dict = model.state_dict()
 
+        # # DEBUG
+        # W = state_dict["lm_head.weight"]
+        # E = state_dict["model.embed_tokens.weight"]
+
+        # print("lm_head shape:", tuple(W.shape), "dtype:", W.dtype, flush=True)
+        # print("embed   shape:", tuple(E.shape), "dtype:", E.dtype, flush=True)
+
+        # # 1) 是否 tie（很多 Qwen/Llama 系会 tie）
+        # same_ptr = (W.data_ptr() == E.data_ptr())
+        # print("tied (same data_ptr)?", same_ptr, flush=True)
+
+        # # 2) 数值统计（随机 init 通常 std 很像 initializer）
+        # Wf = W.float()
+        # Ef = E.float()
+        # print("lm_head mean/std/norm:", Wf.mean().item(), Wf.std().item(), Wf.norm().item(), flush=True)
+        # print("embed   mean/std/norm:", Ef.mean().item(), Ef.std().item(), Ef.norm().item(), flush=True)
+
+        # # 3) 是否几乎相同（如果 tie 或保存成相同值）
+        # print("allclose(W,E)?", torch.allclose(Wf[:128,:128], Ef[:128,:128]), flush=True)
+
+           
+        
+
     return architectures, model, state_dict, is_value_model
 
 
@@ -556,6 +579,8 @@ def get_parallel_gptmodel_from_config(
     from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
     from megatron.core.models.gpt.gpt_model import GPTModel
 
+    # NOTE: Turning off TE manually since we are not able to install TE
+    # use_te = True
     use_te = True
     assert tfconfig.normalization == "RMSNorm", "only RMSNorm is supported for now"
     transformer_layer_spec = get_gpt_decoder_block_spec(tfconfig, use_transformer_engine=use_te)

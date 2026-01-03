@@ -92,6 +92,40 @@ class McoreToHFWeightConverterDense(McoreToHFWeightConverterBase):
         if name in direct_name_mapping:
             return [direct_name_mapping[name]], [params_one_group[0]]
 
+        # import re
+
+        # # Normalize common Megatron/mcore norm naming to HF/vLLM naming.
+        # # - pre_attn_layernorm -> input_layernorm
+        # # - pre_mlp_layernorm  -> post_attention_layernorm
+        # def _norm_kind_to_hf(norm_kind: str) -> str:
+        #     if norm_kind == "pre_attn_layernorm":
+        #         return "input_layernorm"
+        #     if norm_kind == "pre_mlp_layernorm":
+        #         return "post_attention_layernorm"
+        #     return norm_kind
+
+        # # ---- layernorm/rmsnorm mapping ----
+        # # Handle Megatron(mcore) decoder.* -> HF model.*
+        # # Examples:
+        # #   decoder.layers.0.pre_attn_layernorm.weight -> model.layers.0.input_layernorm.weight
+        # #   decoder.layers.0.pre_mlp_layernorm.weight  -> model.layers.0.post_attention_layernorm.weight
+        # #   decoder.layers.0.input_layernorm.weight    -> model.layers.0.input_layernorm.weight  (already HF-like)
+        # m = re.match(r"^decoder\.layers\.(\d+)\.([a-zA-Z0-9_]*layernorm)\.(weight|bias)$", name)
+        # if m:
+        #     layer_id, norm_kind, wb = m.groups()
+        #     norm_kind = _norm_kind_to_hf(norm_kind)
+        #     return [f"model.layers.{layer_id}.{norm_kind}.{wb}"], [params_one_group[0]]
+
+        # # If the name already starts with model.layers.*, still normalize norm kind if it's Megatron-style.
+        # m2 = re.match(r"^model\.layers\.(\d+)\.([a-zA-Z0-9_]*layernorm)\.(weight|bias)$", name)
+        # if m2:
+        #     layer_id, norm_kind, wb = m2.groups()
+        #     norm_kind2 = _norm_kind_to_hf(norm_kind)
+        #     if norm_kind2 != norm_kind:
+        #         return [f"model.layers.{layer_id}.{norm_kind2}.{wb}"], [params_one_group[0]]
+        #     return [name], [params_one_group[0]]
+        # # ----------------------------------
+
         if "self_attention" in name:
             return self._convert_attention_param(name, params_one_group)
         elif "mlp" in name:

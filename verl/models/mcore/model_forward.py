@@ -54,6 +54,16 @@ def model_forward_gen(vision_model: bool = False):
 
         batch_size, seq_len = attention_mask.shape[:2]
         input_ids_rmpad, packed_seq_params = preprocess_packed_seqs(input_ids, attention_mask, pre_process=pre_process)
+        # disable_packed = True
+
+        # if disable_packed:
+        #     input_ids_rmpad = input_ids
+        #     packed_seq_params = None
+        # else:
+        #     input_ids_rmpad, packed_seq_params = preprocess_packed_seqs(
+        #         input_ids, attention_mask, pre_process=pre_process
+        #     )
+
         input_ids_rmpad = input_ids_rmpad.contiguous()
 
         input_args = dict(

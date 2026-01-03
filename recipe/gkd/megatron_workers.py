@@ -27,7 +27,7 @@ from megatron.core import parallel_state as mpu
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.pipeline_parallel import get_forward_backward_func
-from megatron_kl_loss import vocab_parallel_kl_divergence
+from .megatron_kl_loss import vocab_parallel_kl_divergence
 from omegaconf import DictConfig, OmegaConf
 from torch import nn
 
@@ -216,7 +216,9 @@ class OnPolicyDistillActor:
         #     group=mpu.get_pipeline_model_parallel_group(),
         # )
         # split into micro-batches
-        data.batch["attention_mask"] = data.batch["attention_mask"].to(bool)
+        # NOTE: tensordict lock error
+        # data.batch["attention_mask"] = data.batch["attention_mask"].to(bool)
+        data.batch.set_("attention_mask", data.batch["attention_mask"].to(torch.bool))
 
         indices = None
         if use_dynamic_bsz:
@@ -270,15 +272,24 @@ class OnPolicyDistillActor:
             if mpu.is_pipeline_last_stage():
                 teacher_topk_logps = np.array_split(data.non_tensor_batch["teacher_topk_logps"], len(micro_batches))
                 teacher_topk_indices = np.array_split(data.non_tensor_batch["teacher_topk_indices"], len(micro_batches))
+                
                 for i, mb in enumerate(micro_batches):
                     responses = mb["responses"]
                     response_length = responses.size(1)
                     calc_kl_mask = mb["attention_mask"].clone()
+                    # NOTE: otherwise incorrect indexing using int64
+                    # print(f"[DEBUG-CREATE] attention_mask.shape={mb['attention_mask'].shape}, response_length={response_length}")
                     calc_kl_mask[:, : (-response_length - 1)] = False
+                    calc_kl_mask = calc_kl_mask.bool()
+                    # print(f"[DEBUG-CREATE] calc_kl_mask.shape={calc_kl_mask.shape}, calc_kl_mask.dtype={calc_kl_mask.dtype}")
+                    # NOTE: TensorDict is locked, need to unlock to add new keys
+                    mb.unlock_()
                     mb["calc_kl_mask"] = calc_kl_mask
                     mb["kl_losses"] = torch.zeros_like(calc_kl_mask, dtype=torch.float32)
                     mb["teacher_topk_logps"] = torch.tensor(teacher_topk_logps[i]).pin_memory()
                     mb["teacher_topk_indices"] = torch.tensor(teacher_topk_indices[i]).pin_memory()
+                    mb.lock_()
+
 
         # compute input shapes for pp stages
         n_micro_batch = len(micro_batches)
@@ -308,10 +319,16 @@ class OnPolicyDistillActor:
         def forward_step(batch_iter, model):
             batch = next(batch_iter)
             input_ids = batch["input_ids"]
-            attention_mask = batch["attention_mask"]
+            # attention_mask = batch["attention_mask"]
+            attention_mask = batch["attention_mask"].to(torch.bool) # to avoid incorrect int64 indexing in downstream
             position_ids = batch["position_ids"]
 
+
             def logits_processor(logits, teacher_topk_logps, teacher_topk_indices, calc_kl_mask, kl_losses):
+                # print(f"[DEBUG-LOGITS] logits.shape: {logits.shape}")
+                # print(f"[DEBUG-LOGITS] calc_kl_mask.shape: {calc_kl_mask.shape}")
+                # print(f"[DEBUG-LOGITS] teacher_topk_logps.shape: {teacher_topk_logps.shape}")
+                # print(f"[DEBUG-LOGITS] teacher_topk_indices.shape: {teacher_topk_indices.shape}")
                 assert logits.shape[:2] == calc_kl_mask.shape[:2]
                 assert logits.shape[:2] == teacher_topk_indices.shape[:2]
                 assert logits.shape[:2] == teacher_topk_logps.shape[:2]
@@ -459,8 +476,8 @@ class MegatronOnPolicyDistillActorWorker(ActorRolloutRefWorker):
         if self.bridge is not None:
             generator = self.bridge.export_weights(self.actor.actor_module)
         else:
-            # from verl.utils.megatron_utils import per_tensor_generator
-            from megatron_utils import per_tensor_generator
+            from verl.utils.megatron_utils import per_tensor_generator
+            # from megatron_utils import per_tensor_generator
 
             from verl.models.mcore import get_mcore_weight_converter
 

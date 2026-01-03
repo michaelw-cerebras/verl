@@ -165,7 +165,26 @@ class VLLMEngine:
         else:
             sampling_params = make_sampling_params()
 
-        outputs = self.llm.generate(prompt_token_ids=prompt_token_ids, sampling_params=sampling_params)
+        # NOTE: vllm version problem, not supporting prompt_token_ids anymore..
+        # outputs = self.llm.generate(prompt_token_ids=prompt_token_ids, sampling_params=sampling_params)
+        # vLLM API compatibility: newer versions don't accept `prompt_token_ids=` kw.
+        # Use TokensPrompt-style dicts via `prompts=` instead.
+        try:
+            outputs = self.llm.generate(prompt_token_ids=prompt_token_ids, sampling_params=sampling_params)
+        except TypeError:
+            # Normalize to list[list[int]]
+            if isinstance(prompt_token_ids, (list, tuple)) and len(prompt_token_ids) > 0 and isinstance(prompt_token_ids[0], int):
+                ptids_list = [list(prompt_token_ids)]
+            else:
+                ptids_list = [list(x) for x in prompt_token_ids]
+
+            prompts = [{"prompt_token_ids": x} for x in ptids_list]
+            try:
+                outputs = self.llm.generate(prompts=prompts, sampling_params=sampling_params)
+            except TypeError:
+                # Some versions use positional `prompts`
+                outputs = self.llm.generate(prompts, sampling_params=sampling_params)
+
 
         responses, teacher_topk_logprobs, teacher_topk_indices = [], [], []
         for output in outputs:

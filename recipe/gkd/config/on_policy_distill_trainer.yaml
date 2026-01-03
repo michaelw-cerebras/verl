@@ -7,6 +7,10 @@
 #   # load the reference default config, then apply the fields in the current yaml
 #   - _self_
 
+defaults:
+  - reward_model@reward_model: dp_reward_model  
+  - _self_
+
 data:
   tokenizer: null
   train_files: /path/to/train.parquet

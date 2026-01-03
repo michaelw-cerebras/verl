@@ -1,8 +1,13 @@
 export PROXY_FRONTEND_PORT=15555
 export PROXY_BACKEND_PORT=15556
 
+export CUDA_VISIBLE_DEVICES=7
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+
+
 BACKEND=vllm
-CKPT_PATH="/path/to/TEACHER_MODEL/"
+# CKPT_PATH="/path/to/TEACHER_MODEL/"
+CKPT_PATH="Qwen/Qwen2.5-3B-Instruct" 
 
 wait_server_ready() {
     server=$1
