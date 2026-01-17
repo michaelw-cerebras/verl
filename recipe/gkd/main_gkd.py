@@ -30,7 +30,9 @@ RAY_RUNTIME_ENV = {
     "env_vars": {
         "TOKENIZERS_PARALLELISM": "true",
         "VLLM_LOGGING_LEVEL": "WARN",
-        "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "false",
+        "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",  # Enable LoRA support
+        # symmetric memory allreduce not work properly in spmd mode
+        "VLLM_ALLREDUCE_USE_SYMM_MEM": "0",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
         # To prevent hanging or crash during synchronization of weights between actor and rollout
         # in disaggregated mode. See:
