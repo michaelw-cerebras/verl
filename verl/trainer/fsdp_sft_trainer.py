@@ -653,25 +653,27 @@ class FSDPSFTTrainer:
             # For FSDP models, optimize generation by gathering parameters
             # ALL ranks must participate in parameter gathering
             # Critical: synced_gpus=True to prevent hangs in distributed generation
-            if self.config.model.strategy == "fsdp":
-                # FSDP v1: use summon_full_params (recurse=False per PyTorch recommendations)
-                from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-                if rank == 0:
-                    print(f"[DEBUG] Using FSDP.summon_full_params() for efficient generation...")
-                with FSDP.summon_full_params(self.fsdp_model, writeback=False, recurse=False):
+            # Use autocast to match model dtype (bfloat16 for mixed precision training)
+            with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+                if self.config.model.strategy == "fsdp":
+                    # FSDP v1: use summon_full_params (recurse=False per PyTorch recommendations)
+                    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+                    if rank == 0:
+                        print(f"[DEBUG] Using FSDP.summon_full_params() for efficient generation...")
+                    with FSDP.summon_full_params(self.fsdp_model, writeback=False, recurse=False):
+                        outputs = self.fsdp_model.generate(
+                            **inputs, generation_config=generation_config, synced_gpus=True
+                        )
+                elif self.config.model.strategy == "fsdp2":
+                    # FSDP v2: generation should be faster by default as root module doesn't reshard
+                    if rank == 0:
+                        print(f"[DEBUG] Running FSDP2 generation...")
                     outputs = self.fsdp_model.generate(
                         **inputs, generation_config=generation_config, synced_gpus=True
                     )
-            elif self.config.model.strategy == "fsdp2":
-                # FSDP v2: generation should be faster by default as root module doesn't reshard
-                if rank == 0:
-                    print(f"[DEBUG] Running FSDP2 generation...")
-                outputs = self.fsdp_model.generate(
-                    **inputs, generation_config=generation_config, synced_gpus=True
-                )
-            else:
-                # No FSDP, generate directly
-                outputs = self.fsdp_model.generate(**inputs, generation_config=generation_config)
+                else:
+                    # No FSDP, generate directly
+                    outputs = self.fsdp_model.generate(**inputs, generation_config=generation_config)
 
             if rank == 0:
                 print(f"[DEBUG] Generation done in {time.time()-t_gen:.2f}s")
