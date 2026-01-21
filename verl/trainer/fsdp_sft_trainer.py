@@ -133,7 +133,7 @@ class FSDPSFTTrainer:
             # Create accuracy validation dataset with metadata
             from omegaconf import OmegaConf
             accuracy_val_config = OmegaConf.create(OmegaConf.to_container(self.config.data))
-            accuracy_val_config.return_metadata = True
+            # Set ground_truth_key - this will auto-enable return_metadata
             accuracy_val_config.ground_truth_key = self.config.trainer.get(
                 "ground_truth_key", ["reward_model", "ground_truth"]
             )

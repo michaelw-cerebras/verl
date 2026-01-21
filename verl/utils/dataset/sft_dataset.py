@@ -49,8 +49,9 @@ class SFTDataset(Dataset):
         self.shuffle = config.get("shuffle", False)
         self.seed = config.get("seed")
         self.apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})
-        self.return_metadata = config.get("return_metadata", False)
         self.ground_truth_key = config.get("ground_truth_key", None)
+        # Auto-enable return_metadata if ground_truth_key is set
+        self.return_metadata = config.get("return_metadata", self.ground_truth_key is not None)
 
         assert truncation in ["error", "left", "right"]
         self.truncation = truncation
