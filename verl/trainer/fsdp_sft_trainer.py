@@ -597,45 +597,53 @@ class FSDPSFTTrainer:
             )
             prompt_texts.append(prompt_text)
 
-        # Tokenize prompts
-        inputs = self.tokenizer(
-            prompt_texts,
-            return_tensors="pt",
-            padding=True,
-            add_special_tokens=False
-        ).to(self.device_name)
+        # Save original padding side and temporarily set to left for generation
+        original_padding_side = self.tokenizer.padding_side
+        self.tokenizer.padding_side = "left"
 
-        # Create generation config to avoid warnings about unused parameters
-        if temperature == 0.0:
-            # Greedy decoding
-            generation_config = GenerationConfig(
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-            )
-        else:
-            # Sampling
-            generation_config = GenerationConfig(
-                max_new_tokens=max_new_tokens,
-                do_sample=True,
-                temperature=temperature,
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-            )
+        try:
+            # Tokenize prompts
+            inputs = self.tokenizer(
+                prompt_texts,
+                return_tensors="pt",
+                padding=True,
+                add_special_tokens=False
+            ).to(self.device_name)
 
-        # Generate
-        outputs = self.fsdp_model.generate(**inputs, generation_config=generation_config)
+            # Create generation config to avoid warnings about unused parameters
+            if temperature == 0.0:
+                # Greedy decoding
+                generation_config = GenerationConfig(
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                )
+            else:
+                # Sampling
+                generation_config = GenerationConfig(
+                    max_new_tokens=max_new_tokens,
+                    do_sample=True,
+                    temperature=temperature,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                )
 
-        # Decode only the generated part (excluding prompt)
-        generated_texts = []
-        for i, output in enumerate(outputs):
-            prompt_length = inputs.input_ids[i].shape[0]
-            generated_ids = output[prompt_length:]
-            generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-            generated_texts.append(generated_text)
+            # Generate
+            outputs = self.fsdp_model.generate(**inputs, generation_config=generation_config)
 
-        return generated_texts
+            # Decode only the generated part (excluding prompt)
+            generated_texts = []
+            for i, output in enumerate(outputs):
+                prompt_length = inputs.input_ids[i].shape[0]
+                generated_ids = output[prompt_length:]
+                generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+                generated_texts.append(generated_text)
+
+            return generated_texts
+        finally:
+            # Always restore original padding side
+            self.tokenizer.padding_side = original_padding_side
 
     def validation_accuracy_step(self, batch_data: list[dict], compute_score_fn, max_new_tokens: int = None):
         """Compute validation accuracy using generation.
