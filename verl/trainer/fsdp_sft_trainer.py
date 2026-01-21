@@ -635,6 +635,8 @@ class FSDPSFTTrainer:
                     do_sample=False,
                     pad_token_id=self.tokenizer.pad_token_id,
                     eos_token_id=self.tokenizer.eos_token_id,
+                    # Critical for FSDP: sync all GPUs during generation
+                    synced_gpus=True,
                 )
             else:
                 # Sampling
@@ -644,6 +646,8 @@ class FSDPSFTTrainer:
                     temperature=temperature,
                     pad_token_id=self.tokenizer.pad_token_id,
                     eos_token_id=self.tokenizer.eos_token_id,
+                    # Critical for FSDP: sync all GPUs during generation
+                    synced_gpus=True,
                 )
 
             if rank == 0:
