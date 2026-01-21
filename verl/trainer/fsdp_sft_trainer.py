@@ -956,7 +956,17 @@ class FSDPSFTTrainer:
                             # Process in smaller batches for generation
                             gen_batch_size = self.config.trainer.get("gen_batch_size", 4)
                             all_scores = []
-                            for i in range(0, len(all_batch_data), gen_batch_size):
+
+                            # Create progress bar
+                            num_batches = (len(all_batch_data) + gen_batch_size - 1) // gen_batch_size
+                            pbar = tqdm(
+                                range(0, len(all_batch_data), gen_batch_size),
+                                total=num_batches,
+                                desc="Computing accuracy",
+                                disable=False
+                            )
+
+                            for i in pbar:
                                 batch = all_batch_data[i:i+gen_batch_size]
 
                                 # Create score function with kwargs
@@ -970,6 +980,10 @@ class FSDPSFTTrainer:
                                     batch, score_fn, max_new_tokens=max_new_tokens
                                 )
                                 all_scores.extend(scores)
+
+                                # Update progress bar with current accuracy
+                                current_acc = sum(all_scores) / len(all_scores) if len(all_scores) > 0 else 0.0
+                                pbar.set_postfix({"acc": f"{current_acc:.4f}"})
 
                             # Compute overall accuracy
                             overall_accuracy = sum(all_scores) / len(all_scores) if len(all_scores) > 0 else 0.0
