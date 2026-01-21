@@ -139,11 +139,16 @@ class FSDPSFTTrainer:
             )
 
             # Create accuracy validation dataset
+            # Use -1 to indicate "use all samples" if accuracy_val_max_samples is None or not set
+            accuracy_max_samples = self.config.trainer.get("accuracy_val_max_samples", 100)
+            if accuracy_max_samples is None:
+                accuracy_max_samples = -1
+
             self.accuracy_val_dataset = create_sft_dataset(
                 self.config.data.val_files,
                 accuracy_val_config,
                 tokenizer,
-                max_samples=self.config.trainer.get("accuracy_val_max_samples", 100)
+                max_samples=accuracy_max_samples
             )
             if self.device_mesh.get_rank() == 0:
                 print(f"Accuracy validation enabled with {len(self.accuracy_val_dataset)} samples")
