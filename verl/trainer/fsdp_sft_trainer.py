@@ -1046,19 +1046,28 @@ class FSDPSFTTrainer:
                             if rank == 0:
                                 scores = []
                                 for idx, (generated_text, ground_truth) in enumerate(zip(generated_texts, ground_truths)):
-                                    if ground_truth is not None:
-                                        score = self.compute_score_fn(
-                                            generated_text, ground_truth, **self.compute_score_kwargs
-                                        )
-                                        scores.append(score)
+                                    sample_num = len(all_scores) + idx + 1
 
-                                        # Print first few examples for debugging
-                                        if len(all_scores) + idx < 3:
-                                            print(f"\n[DEBUG] Sample {len(all_scores) + idx + 1}:")
-                                            print(f"  Prompt: {prompts[idx][:100]}...")
-                                            print(f"  Generated: {generated_text[:200]}...")
-                                            print(f"  Ground truth: {ground_truth}")
+                                    # Print ALL samples for debugging (not just first 3)
+                                    print(f"\n[DEBUG] Sample {sample_num}:")
+                                    print(f"  Prompt: {prompts[idx][:150]}...")
+                                    print(f"  Generated: '{generated_text}'")
+                                    print(f"  Ground truth: '{ground_truth}'")
+                                    print(f"  Ground truth type: {type(ground_truth)}")
+
+                                    if ground_truth is not None:
+                                        try:
+                                            score = self.compute_score_fn(
+                                                generated_text, ground_truth, **self.compute_score_kwargs
+                                            )
+                                            scores.append(score)
                                             print(f"  Score: {score}")
+                                        except Exception as e:
+                                            print(f"  Error computing score: {e}")
+                                            scores.append(0)
+                                    else:
+                                        print(f"  Ground truth is None, skipping")
+
                                 all_scores.extend(scores)
 
                                 # Update progress bar
