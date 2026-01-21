@@ -584,6 +584,8 @@ class FSDPSFTTrainer:
         Returns:
             List of generated response strings
         """
+        from transformers import GenerationConfig
+
         self.fsdp_model.eval()
 
         # Apply chat template to prompts
@@ -603,24 +605,27 @@ class FSDPSFTTrainer:
             add_special_tokens=False
         ).to(self.device_name)
 
-        # Generate
+        # Create generation config to avoid warnings about unused parameters
         if temperature == 0.0:
-            outputs = self.fsdp_model.generate(
-                **inputs,
+            # Greedy decoding
+            generation_config = GenerationConfig(
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
                 pad_token_id=self.tokenizer.pad_token_id,
                 eos_token_id=self.tokenizer.eos_token_id,
             )
         else:
-            outputs = self.fsdp_model.generate(
-                **inputs,
+            # Sampling
+            generation_config = GenerationConfig(
                 max_new_tokens=max_new_tokens,
                 do_sample=True,
                 temperature=temperature,
                 pad_token_id=self.tokenizer.pad_token_id,
                 eos_token_id=self.tokenizer.eos_token_id,
             )
+
+        # Generate
+        outputs = self.fsdp_model.generate(**inputs, generation_config=generation_config)
 
         # Decode only the generated part (excluding prompt)
         generated_texts = []
