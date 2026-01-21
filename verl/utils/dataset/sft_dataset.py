@@ -226,10 +226,12 @@ class SFTDataset(Dataset):
                         # Navigate nested structure, e.g., ["reward_model", "ground_truth"]
                         ground_truth = self.dataframe.iloc[item]
                         for key in self.ground_truth_key:
-                            # First access the key from Series/dict
-                            ground_truth = ground_truth[key]
-                            # Then unwrap if it's a pandas/numpy structure
+                            # First unwrap pandas/numpy structures
                             ground_truth = series_to_item(ground_truth)
+                            # Then access the key (works for both dict and Series)
+                            ground_truth = ground_truth[key]
+                        # Final unwrap after all navigation
+                        ground_truth = series_to_item(ground_truth)
                     else:
                         ground_truth = self.dataframe.iloc[item][self.ground_truth_key]
                         ground_truth = series_to_item(ground_truth)
@@ -237,12 +239,6 @@ class SFTDataset(Dataset):
                 except (KeyError, TypeError, IndexError) as e:
                     print(f"Warning: Failed to extract ground_truth for item {item}: {e}")
                     print(f"  ground_truth_key: {self.ground_truth_key}")
-                    print(f"  dataframe row keys: {list(self.dataframe.iloc[item].index)}")
-                    if len(self.ground_truth_key) > 0:
-                        first_key = self.ground_truth_key[0] if isinstance(self.ground_truth_key, list) else self.ground_truth_key
-                        if first_key in self.dataframe.iloc[item].index:
-                            print(f"  {first_key} value: {self.dataframe.iloc[item][first_key]}")
-                            print(f"  {first_key} type: {type(self.dataframe.iloc[item][first_key])}")
                     result["ground_truth"] = None
 
         return result
