@@ -584,7 +584,11 @@ class FSDPSFTTrainer:
         Returns:
             List of generated response strings
         """
+        import time
         from transformers import GenerationConfig
+
+        if self.device_mesh.get_rank() == 0:
+            print(f"[DEBUG] Starting generation for {len(prompts)} prompts with max_new_tokens={max_new_tokens}")
 
         self.fsdp_model.eval()
 
@@ -602,6 +606,10 @@ class FSDPSFTTrainer:
         self.tokenizer.padding_side = "left"
 
         try:
+            if self.device_mesh.get_rank() == 0:
+                t0 = time.time()
+                print(f"[DEBUG] Tokenizing prompts...")
+
             # Tokenize prompts
             inputs = self.tokenizer(
                 prompt_texts,
@@ -609,6 +617,10 @@ class FSDPSFTTrainer:
                 padding=True,
                 add_special_tokens=False
             ).to(self.device_name)
+
+            if self.device_mesh.get_rank() == 0:
+                print(f"[DEBUG] Tokenization done in {time.time()-t0:.2f}s, input shape: {inputs.input_ids.shape}")
+                print(f"[DEBUG] Creating generation config...")
 
             # Create generation config to avoid warnings about unused parameters
             if temperature == 0.0:
@@ -629,8 +641,16 @@ class FSDPSFTTrainer:
                     eos_token_id=self.tokenizer.eos_token_id,
                 )
 
+            if self.device_mesh.get_rank() == 0:
+                t_gen = time.time()
+                print(f"[DEBUG] Starting model.generate()...")
+
             # Generate
             outputs = self.fsdp_model.generate(**inputs, generation_config=generation_config)
+
+            if self.device_mesh.get_rank() == 0:
+                print(f"[DEBUG] Generation done in {time.time()-t_gen:.2f}s")
+                print(f"[DEBUG] Decoding outputs...")
 
             # Decode only the generated part (excluding prompt)
             generated_texts = []
