@@ -650,16 +650,22 @@ class FSDPSFTTrainer:
                 t_gen = time.time()
                 print(f"[DEBUG] Starting model.generate() with FSDP optimization...")
 
-            # For FSDP models, use summon_full_params to gather sharded parameters
-            # ALL ranks must participate in summon_full_params
+            # For FSDP models, optimize generation by gathering parameters
+            # ALL ranks must participate in parameter gathering
             if self.config.model.strategy == "fsdp":
+                # FSDP v1: use summon_full_params (recurse=False per PyTorch recommendations)
                 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
                 if rank == 0:
                     print(f"[DEBUG] Using FSDP.summon_full_params() for efficient generation...")
-                with FSDP.summon_full_params(self.fsdp_model, writeback=False, recurse=True):
+                with FSDP.summon_full_params(self.fsdp_model, writeback=False, recurse=False):
                     outputs = self.fsdp_model.generate(**inputs, generation_config=generation_config)
+            elif self.config.model.strategy == "fsdp2":
+                # FSDP v2: generation should be faster by default as root module doesn't reshard
+                if rank == 0:
+                    print(f"[DEBUG] Running FSDP2 generation...")
+                outputs = self.fsdp_model.generate(**inputs, generation_config=generation_config)
             else:
-                # For fsdp2 or other strategies, generate directly
+                # No FSDP, generate directly
                 outputs = self.fsdp_model.generate(**inputs, generation_config=generation_config)
 
             if rank == 0:
