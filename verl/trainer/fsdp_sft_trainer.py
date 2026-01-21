@@ -984,8 +984,10 @@ class FSDPSFTTrainer:
                         if rank == 0:
                             print(f"\nComputing validation accuracy at step {global_step}...")
 
-                        # All ranks participate (FSDP requirement for summon_full_params)
-                        # But only rank 0 has real data
+                        # Prepare data and determine number of batches (only on rank 0)
+                        gen_batch_size = self.config.trainer.get("gen_batch_size", 4)
+                        max_new_tokens = self.config.trainer.get("accuracy_max_new_tokens", None)
+
                         if rank == 0:
                             batch_size = self.config.trainer.get("accuracy_batch_size", 8)
                             all_batch_data = []
@@ -996,37 +998,65 @@ class FSDPSFTTrainer:
                                     batch_data.append(item)
                                 all_batch_data.extend(batch_data)
 
-                            gen_batch_size = self.config.trainer.get("gen_batch_size", 4)
-                            all_scores = []
-
-                            # Create progress bar
                             num_batches = (len(all_batch_data) + gen_batch_size - 1) // gen_batch_size
+                        else:
+                            num_batches = 0
+
+                        # Broadcast number of batches to all ranks so they know how many times to call generate
+                        num_batches_tensor = torch.tensor(num_batches, device=self.device_name, dtype=torch.long)
+                        torch.distributed.broadcast(num_batches_tensor, src=0)
+                        num_batches = num_batches_tensor.item()
+
+                        if rank == 0:
+                            all_scores = []
                             pbar = tqdm(
-                                range(0, len(all_batch_data), gen_batch_size),
+                                range(num_batches),
                                 total=num_batches,
                                 desc="Computing accuracy",
                                 disable=False
                             )
 
-                            for i in pbar:
+                        # ALL ranks participate in the loop (FSDP requirement)
+                        for batch_idx in range(num_batches):
+                            if rank == 0:
+                                # Rank 0 processes real data
+                                i = batch_idx * gen_batch_size
                                 batch = all_batch_data[i:i+gen_batch_size]
+                                prompts = [item["prompt"] for item in batch]
+                                ground_truths = [item["ground_truth"] for item in batch]
+                            else:
+                                # Other ranks use dummy data (same batch size for consistency)
+                                prompts = ["dummy"] * gen_batch_size
+                                ground_truths = [None] * gen_batch_size
 
-                                # Create score function with kwargs
-                                def score_fn(generated_text, ground_truth):
-                                    return self.compute_score_fn(
-                                        generated_text, ground_truth, **self.compute_score_kwargs
-                                    )
+                            # Use the actual max_new_tokens
+                            if max_new_tokens is None:
+                                actual_max_new_tokens = self.config.data.max_length
+                            else:
+                                actual_max_new_tokens = max_new_tokens
 
-                                max_new_tokens = self.config.trainer.get("accuracy_max_new_tokens", None)
-                                _, scores = self.validation_accuracy_step(
-                                    batch, score_fn, max_new_tokens=max_new_tokens
-                                )
+                            # All ranks call generate (FSDP requirement)
+                            generated_texts = self.generate_responses(
+                                prompts, max_new_tokens=actual_max_new_tokens, temperature=0.0
+                            )
+
+                            # Only rank 0 computes scores
+                            if rank == 0:
+                                scores = []
+                                for generated_text, ground_truth in zip(generated_texts, ground_truths):
+                                    if ground_truth is not None:
+                                        score = self.compute_score_fn(
+                                            generated_text, ground_truth, **self.compute_score_kwargs
+                                        )
+                                        scores.append(score)
                                 all_scores.extend(scores)
 
-                                # Update progress bar with current accuracy
+                                # Update progress bar
                                 current_acc = sum(all_scores) / len(all_scores) if len(all_scores) > 0 else 0.0
                                 pbar.set_postfix({"acc": f"{current_acc:.4f}"})
+                                pbar.update(1)
 
+                        if rank == 0:
                             # Compute overall accuracy
                             overall_accuracy = sum(all_scores) / len(all_scores) if len(all_scores) > 0 else 0.0
                             accuracy_metric = {"val/accuracy": overall_accuracy}
