@@ -582,15 +582,20 @@ class FSDPSFTTrainer:
             temperature: Sampling temperature (0 for greedy decoding)
 
         Returns:
-            List of generated response strings
+            List of generated response strings (only valid on rank 0)
         """
         import time
         from transformers import GenerationConfig
 
-        if self.device_mesh.get_rank() == 0:
+        rank = self.device_mesh.get_rank()
+        if rank == 0:
             print(f"[DEBUG] Starting generation for {len(prompts)} prompts with max_new_tokens={max_new_tokens}")
 
         self.fsdp_model.eval()
+
+        # Only rank 0 processes the actual prompts, others use dummy
+        if rank != 0:
+            prompts = ["dummy"]  # Other ranks use dummy prompt
 
         # Apply chat template to prompts
         prompt_texts = []
@@ -606,7 +611,7 @@ class FSDPSFTTrainer:
         self.tokenizer.padding_side = "left"
 
         try:
-            if self.device_mesh.get_rank() == 0:
+            if rank == 0:
                 t0 = time.time()
                 print(f"[DEBUG] Tokenizing prompts...")
 
@@ -618,7 +623,7 @@ class FSDPSFTTrainer:
                 add_special_tokens=False
             ).to(self.device_name)
 
-            if self.device_mesh.get_rank() == 0:
+            if rank == 0:
                 print(f"[DEBUG] Tokenization done in {time.time()-t0:.2f}s, input shape: {inputs.input_ids.shape}")
                 print(f"[DEBUG] Creating generation config...")
 
@@ -641,24 +646,34 @@ class FSDPSFTTrainer:
                     eos_token_id=self.tokenizer.eos_token_id,
                 )
 
-            if self.device_mesh.get_rank() == 0:
+            if rank == 0:
                 t_gen = time.time()
-                print(f"[DEBUG] Starting model.generate()...")
+                print(f"[DEBUG] Starting model.generate() with FSDP optimization...")
 
-            # Generate
-            outputs = self.fsdp_model.generate(**inputs, generation_config=generation_config)
+            # For FSDP models, use summon_full_params to gather sharded parameters
+            # ALL ranks must participate in summon_full_params
+            if self.config.model.strategy == "fsdp":
+                from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+                if rank == 0:
+                    print(f"[DEBUG] Using FSDP.summon_full_params() for efficient generation...")
+                with FSDP.summon_full_params(self.fsdp_model, writeback=False, recurse=True):
+                    outputs = self.fsdp_model.generate(**inputs, generation_config=generation_config)
+            else:
+                # For fsdp2 or other strategies, generate directly
+                outputs = self.fsdp_model.generate(**inputs, generation_config=generation_config)
 
-            if self.device_mesh.get_rank() == 0:
+            if rank == 0:
                 print(f"[DEBUG] Generation done in {time.time()-t_gen:.2f}s")
                 print(f"[DEBUG] Decoding outputs...")
 
-            # Decode only the generated part (excluding prompt)
+            # Only rank 0 decodes the actual outputs
             generated_texts = []
-            for i, output in enumerate(outputs):
-                prompt_length = inputs.input_ids[i].shape[0]
-                generated_ids = output[prompt_length:]
-                generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-                generated_texts.append(generated_text)
+            if rank == 0:
+                for i, output in enumerate(outputs):
+                    prompt_length = inputs.input_ids[i].shape[0]
+                    generated_ids = output[prompt_length:]
+                    generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+                    generated_texts.append(generated_text)
 
             return generated_texts
         finally:
@@ -958,22 +973,18 @@ class FSDPSFTTrainer:
                         if rank == 0:
                             print(f"\nComputing validation accuracy at step {global_step}...")
 
-                        # Collect batch data with metadata
-                        batch_size = self.config.trainer.get("accuracy_batch_size", 8)
-                        all_batch_data = []
-                        for i in range(0, len(self.accuracy_val_dataset), batch_size):
-                            batch_data = []
-                            for j in range(i, min(i + batch_size, len(self.accuracy_val_dataset))):
-                                item = self.accuracy_val_dataset[j]
-                                batch_data.append(item)
-
-                            # Compute accuracy for this batch (only on rank 0 to avoid redundant generation)
-                            if rank == 0:
+                        # All ranks participate (FSDP requirement for summon_full_params)
+                        # But only rank 0 has real data
+                        if rank == 0:
+                            batch_size = self.config.trainer.get("accuracy_batch_size", 8)
+                            all_batch_data = []
+                            for i in range(0, len(self.accuracy_val_dataset), batch_size):
+                                batch_data = []
+                                for j in range(i, min(i + batch_size, len(self.accuracy_val_dataset))):
+                                    item = self.accuracy_val_dataset[j]
+                                    batch_data.append(item)
                                 all_batch_data.extend(batch_data)
 
-                        # Compute accuracy only on rank 0
-                        if rank == 0 and len(all_batch_data) > 0:
-                            # Process in smaller batches for generation
                             gen_batch_size = self.config.trainer.get("gen_batch_size", 4)
                             all_scores = []
 
