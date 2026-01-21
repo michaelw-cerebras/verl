@@ -49,6 +49,8 @@ class SFTDataset(Dataset):
         self.shuffle = config.get("shuffle", False)
         self.seed = config.get("seed")
         self.apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})
+        self.return_metadata = config.get("return_metadata", False)
+        self.ground_truth_key = config.get("ground_truth_key", None)
 
         assert truncation in ["error", "left", "right"]
         self.truncation = truncation
@@ -196,9 +198,30 @@ class SFTDataset(Dataset):
         # mask out the last token in response
         loss_mask[min(prompt_length + response_length, loss_mask.size(0)) - 1] = 0
 
-        return {
+        result = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "position_ids": position_ids,
             "loss_mask": loss_mask,
         }
+
+        # Add metadata if requested
+        if self.return_metadata:
+            result["prompt"] = prompt
+            result["response"] = response
+
+            # Add ground truth if available
+            if self.ground_truth_key is not None:
+                try:
+                    if isinstance(self.ground_truth_key, list):
+                        # Navigate nested structure, e.g., ["reward_model", "ground_truth"]
+                        ground_truth = self.dataframe.iloc[item]
+                        for key in self.ground_truth_key:
+                            ground_truth = ground_truth[key]
+                    else:
+                        ground_truth = self.dataframe.iloc[item][self.ground_truth_key]
+                    result["ground_truth"] = ground_truth
+                except (KeyError, TypeError):
+                    result["ground_truth"] = None
+
+        return result

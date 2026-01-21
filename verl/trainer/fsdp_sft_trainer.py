@@ -117,6 +117,39 @@ class FSDPSFTTrainer:
 
         self._build_dataloader(train_dataset, val_dataset)
 
+        # Setup accuracy validation if enabled
+        self.enable_accuracy_validation = self.config.trainer.get("enable_accuracy_validation", False)
+        if self.enable_accuracy_validation:
+            # Import compute_score function
+            compute_score_module = self.config.trainer.get("compute_score_module", "verl.utils.reward_score.gsm8k")
+            compute_score_fn_name = self.config.trainer.get("compute_score_fn", "compute_score")
+
+            # Dynamically import the compute_score function
+            from importlib import import_module
+            module = import_module(compute_score_module)
+            self.compute_score_fn = getattr(module, compute_score_fn_name)
+
+            # Get compute_score kwargs if any
+            self.compute_score_kwargs = self.config.trainer.get("compute_score_kwargs", {})
+
+            # Create accuracy validation dataset with metadata
+            from omegaconf import OmegaConf
+            accuracy_val_config = OmegaConf.create(OmegaConf.to_container(self.config.data))
+            accuracy_val_config.return_metadata = True
+            accuracy_val_config.ground_truth_key = self.config.trainer.get(
+                "ground_truth_key", ["reward_model", "ground_truth"]
+            )
+
+            # Create accuracy validation dataset
+            self.accuracy_val_dataset = create_sft_dataset(
+                self.config.data.val_files,
+                accuracy_val_config,
+                tokenizer,
+                max_samples=self.config.trainer.get("accuracy_val_max_samples", 100)
+            )
+        else:
+            self.accuracy_val_dataset = None
+
         self.lora = self.config.model.get("lora_adapter_path") is not None or self.config.model.lora_rank > 0
 
         # Initialize resume-related variables
@@ -534,6 +567,98 @@ class FSDPSFTTrainer:
                 loss /= self.device_mesh.size(0)
         return loss
 
+    @torch.no_grad()
+    def generate_responses(self, prompts: list[str], max_new_tokens: int = 512, temperature: float = 0.0):
+        """Generate responses for given prompts using greedy decoding or sampling.
+
+        Args:
+            prompts: List of prompt strings
+            max_new_tokens: Maximum number of tokens to generate
+            temperature: Sampling temperature (0 for greedy decoding)
+
+        Returns:
+            List of generated response strings
+        """
+        self.fsdp_model.eval()
+
+        # Apply chat template to prompts
+        prompt_texts = []
+        for prompt in prompts:
+            prompt_chat = [{"role": "user", "content": prompt}]
+            prompt_text = self.tokenizer.apply_chat_template(
+                prompt_chat, add_generation_prompt=True, tokenize=False
+            )
+            prompt_texts.append(prompt_text)
+
+        # Tokenize prompts
+        inputs = self.tokenizer(
+            prompt_texts,
+            return_tensors="pt",
+            padding=True,
+            add_special_tokens=False
+        ).to(self.device_name)
+
+        # Generate
+        if temperature == 0.0:
+            outputs = self.fsdp_model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+            )
+        else:
+            outputs = self.fsdp_model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                temperature=temperature,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+            )
+
+        # Decode only the generated part (excluding prompt)
+        generated_texts = []
+        for i, output in enumerate(outputs):
+            prompt_length = inputs.input_ids[i].shape[0]
+            generated_ids = output[prompt_length:]
+            generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+            generated_texts.append(generated_text)
+
+        return generated_texts
+
+    def validation_accuracy_step(self, batch_data: list[dict], compute_score_fn, max_new_tokens: int = 512):
+        """Compute validation accuracy using generation.
+
+        Args:
+            batch_data: List of data items with 'prompt', 'ground_truth' fields
+            compute_score_fn: Function to compute score given (generated_text, ground_truth)
+            max_new_tokens: Maximum number of tokens to generate
+
+        Returns:
+            Average accuracy for the batch
+        """
+        prompts = [item["prompt"] for item in batch_data]
+        ground_truths = [item["ground_truth"] for item in batch_data]
+
+        # Generate responses
+        generated_texts = self.generate_responses(prompts, max_new_tokens=max_new_tokens, temperature=0.0)
+
+        # Compute scores
+        scores = []
+        for generated_text, ground_truth in zip(generated_texts, ground_truths):
+            if ground_truth is not None:
+                score = compute_score_fn(generated_text, ground_truth)
+                scores.append(score)
+
+        # Compute average accuracy
+        if len(scores) > 0:
+            accuracy = sum(scores) / len(scores)
+        else:
+            accuracy = 0.0
+
+        return accuracy, scores
+
     def save_checkpoint(self, step):
         """Save checkpoint using FSDPCheckpointManager with improved tracking"""
         from verl.utils.fs import local_mkdir_safe
@@ -771,7 +896,7 @@ class FSDPSFTTrainer:
 
                 # early exit or validation step
                 if is_last_step or (self.config.trainer.test_freq > 0 and is_valid_step):
-                    # Perform validation
+                    # Perform validation loss
                     val_losses = []
                     for val_data in self.val_dataloader:
                         val_data = TensorDict(val_data, batch_size=self.config.data.micro_batch_size_per_gpu).to(
@@ -785,6 +910,60 @@ class FSDPSFTTrainer:
                         tracking.log(data=metric, step=global_step)
                         last_valid_metric = metric
                     torch.distributed.barrier()
+
+                    # Perform accuracy validation if enabled
+                    if self.enable_accuracy_validation:
+                        accuracy_freq = self.config.trainer.get("accuracy_test_freq", self.config.trainer.test_freq)
+                        is_accuracy_step = global_step % accuracy_freq == 0
+                        if is_last_step or (accuracy_freq > 0 and is_accuracy_step):
+                            if rank == 0:
+                                print(f"\nComputing validation accuracy at step {global_step}...")
+
+                            # Collect batch data with metadata
+                            batch_size = self.config.trainer.get("accuracy_batch_size", 8)
+                            all_batch_data = []
+                            for i in range(0, len(self.accuracy_val_dataset), batch_size):
+                                batch_data = []
+                                for j in range(i, min(i + batch_size, len(self.accuracy_val_dataset))):
+                                    item = self.accuracy_val_dataset[j]
+                                    batch_data.append(item)
+
+                                # Compute accuracy for this batch (only on rank 0 to avoid redundant generation)
+                                if rank == 0:
+                                    all_batch_data.extend(batch_data)
+
+                            # Compute accuracy only on rank 0
+                            if rank == 0 and len(all_batch_data) > 0:
+                                # Process in smaller batches for generation
+                                gen_batch_size = self.config.trainer.get("gen_batch_size", 4)
+                                all_scores = []
+                                for i in range(0, len(all_batch_data), gen_batch_size):
+                                    batch = all_batch_data[i:i+gen_batch_size]
+
+                                    # Create score function with kwargs
+                                    def score_fn(generated_text, ground_truth):
+                                        return self.compute_score_fn(
+                                            generated_text, ground_truth, **self.compute_score_kwargs
+                                        )
+
+                                    max_new_tokens = self.config.trainer.get("accuracy_max_new_tokens", 512)
+                                    _, scores = self.validation_accuracy_step(
+                                        batch, score_fn, max_new_tokens=max_new_tokens
+                                    )
+                                    all_scores.extend(scores)
+
+                                # Compute overall accuracy
+                                overall_accuracy = sum(all_scores) / len(all_scores) if len(all_scores) > 0 else 0.0
+                                accuracy_metric = {"val/accuracy": overall_accuracy}
+                                tracking.log(data=accuracy_metric, step=global_step)
+                                print(f"Validation accuracy: {overall_accuracy:.4f}")
+
+                                if last_valid_metric is not None:
+                                    last_valid_metric.update(accuracy_metric)
+                                else:
+                                    last_valid_metric = accuracy_metric
+
+                            torch.distributed.barrier()
 
                 if is_last_step or (self.config.trainer.save_freq > 0 and is_save_step):
                     self.save_checkpoint(step=global_step)
