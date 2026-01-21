@@ -1045,12 +1045,20 @@ class FSDPSFTTrainer:
                             # Only rank 0 computes scores
                             if rank == 0:
                                 scores = []
-                                for generated_text, ground_truth in zip(generated_texts, ground_truths):
+                                for idx, (generated_text, ground_truth) in enumerate(zip(generated_texts, ground_truths)):
                                     if ground_truth is not None:
                                         score = self.compute_score_fn(
                                             generated_text, ground_truth, **self.compute_score_kwargs
                                         )
                                         scores.append(score)
+
+                                        # Print first few examples for debugging
+                                        if len(all_scores) + idx < 3:
+                                            print(f"\n[DEBUG] Sample {len(all_scores) + idx + 1}:")
+                                            print(f"  Prompt: {prompts[idx][:100]}...")
+                                            print(f"  Generated: {generated_text[:200]}...")
+                                            print(f"  Ground truth: {ground_truth}")
+                                            print(f"  Score: {score}")
                                 all_scores.extend(scores)
 
                                 # Update progress bar
