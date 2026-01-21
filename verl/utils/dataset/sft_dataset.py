@@ -137,6 +137,14 @@ class SFTDataset(Dataset):
         return len(self.prompts)
 
     def __getitem__(self, item):
+        def series_to_item(ls):
+            import numpy
+            import pandas
+
+            while isinstance(ls, pandas.core.series.Series | numpy.ndarray) and len(ls) == 1:
+                ls = ls[0]
+            return ls
+
         tokenizer = self.tokenizer
 
         prompt = self.prompts[item]
@@ -218,11 +226,21 @@ class SFTDataset(Dataset):
                         # Navigate nested structure, e.g., ["reward_model", "ground_truth"]
                         ground_truth = self.dataframe.iloc[item]
                         for key in self.ground_truth_key:
-                            ground_truth = ground_truth[key]
+                            # Use series_to_item to unwrap pandas/numpy structures
+                            ground_truth = series_to_item(ground_truth)
+                            if isinstance(ground_truth, dict):
+                                ground_truth = ground_truth[key]
+                            else:
+                                # Try to access as attribute if it's not a dict
+                                ground_truth = ground_truth[key]
                     else:
                         ground_truth = self.dataframe.iloc[item][self.ground_truth_key]
+                        ground_truth = series_to_item(ground_truth)
                     result["ground_truth"] = ground_truth
-                except (KeyError, TypeError):
+                except (KeyError, TypeError, IndexError) as e:
+                    print(f"Warning: Failed to extract ground_truth for item {item}: {e}")
+                    print(f"  ground_truth_key: {self.ground_truth_key}")
+                    print(f"  dataframe row: {self.dataframe.iloc[item].to_dict()}")
                     result["ground_truth"] = None
 
         return result
