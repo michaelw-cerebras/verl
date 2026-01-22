@@ -15,7 +15,7 @@
 import logging
 import os
 from functools import partial
-from typing import Any, Callable, Iterator, Optional
+from typing import Any, Callable, ContextManager, Iterator, Optional
 
 import torch
 import torch.distributed
@@ -461,6 +461,9 @@ class MegatronEngine(BaseEngine):
                 self.layer_name_mapping,
             )
         return per_tensor_param
+
+    def disable_adapter(self) -> ContextManager:
+        return self.peft_cls.disable_adapter(self.module)
 
     def forward_step(self, batch_iter, model, postprocess_micro_batch_func):
         raise NotImplementedError("forward_step must be implemented in subclass")

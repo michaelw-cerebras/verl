@@ -19,6 +19,7 @@ import datetime
 import logging
 import os
 import time
+from contextlib import nullcontext
 from typing import Any, Optional
 
 import psutil
@@ -171,6 +172,13 @@ class MegatronWorker(Worker):
         self.hf_config = hf_config
         self.tf_config = tf_config
 
+        # Get PEFT config from model.lora if specified
+        from verl.workers.config.megatron_peft import get_peft_cls
+
+        self.peft_cls = get_peft_cls(
+            model_config=self.config.model, bridge=self.bridge, provider=self.provider, dtype=dtype
+        )
+
 
 class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     """
@@ -286,6 +294,13 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 )
             self._ref_is_offload_param = self.config.ref.megatron.get("param_offload", False)
 
+        # Initialize PEFT class for LoRA support
+        # This needs to be done after HF/TF config initialization, so we defer it to init_model()
+        # For now, set placeholder values
+        self.bridge = None
+        self.provider = None
+        self.peft_cls = None
+
     def _build_model_optimizer(
         self, model_path, optim_config, override_model_config, override_transformer_config, override_ddp_config=None
     ):
@@ -315,14 +330,18 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 wrap_with_ddp=True,
                 use_distributed_optimizer=self.config.actor.megatron.use_distributed_optimizer,
             )
-            actor_module = make_megatron_module(
+            actor_module, updated_tf_config = make_megatron_module(
                 wrap_config=wrap_config,
                 tf_config=self.tf_config,
                 hf_config=self.hf_config,
                 bridge=self.bridge,
+                provider=self.provider,
                 override_model_config=override_model_config,
                 override_ddp_config=override_ddp_config,
+                peft_cls=self.peft_cls,
+                peft_config=self.config.model.get("lora", None),
             )
+            self.tf_config = updated_tf_config
             print(f"actor_module: {len(actor_module)}")
             if self.config.actor.load_weight:
                 if self.config.actor.megatron.use_dist_checkpointing:
@@ -348,13 +367,17 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 wrap_with_ddp=False,
                 use_distributed_optimizer=self.config.ref.megatron.use_distributed_optimizer,
             )
-            ref_module = make_megatron_module(
+            ref_module, updated_tf_config = make_megatron_module(
                 wrap_config=wrap_config,
                 tf_config=self.tf_config,
                 hf_config=self.hf_config,
                 bridge=self.bridge,
+                provider=self.provider,
                 override_model_config=override_model_config,
+                peft_cls=self.peft_cls,
+                peft_config=self.config.model.get("lora", None),
             )
+            self.tf_config = updated_tf_config
             if self.config.ref.load_weight:  # should align with the actor:
                 assert self.config.actor.load_weight == self.config.ref.load_weight
                 print("load ref weight start")
@@ -543,7 +566,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 use_distributed_optimizer=self.config.actor.megatron.use_distributed_optimizer,
                 use_checkpoint_opt_param_scheduler=self.config.actor.optim.use_checkpoint_opt_param_scheduler,
                 bridge=self.bridge,
+                provider=self.provider,
                 use_dist_checkpointing=self.config.actor.megatron.use_dist_checkpointing,
+                peft_cls=self.peft_cls,
             )
 
             self.layer_name_mapping = {
@@ -710,6 +735,10 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     @GPUMemoryLogger(role="compute_ref_log_prob", logger=logger)
     @DistProfiler.annotate(color="olive")
     def compute_ref_log_prob(self, data: DataProto):
+        if self.peft_cls is not None:
+            # if is lora, actor without lora applied is the ref
+            data.meta_info["is_lora"] = True
+            return self.compute_log_prob(data)
         assert self._is_ref
         if self._ref_is_offload_param:
             load_megatron_model_to_gpu(self.ref_module, load_grad=False)
@@ -736,14 +765,21 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.actor_module, load_grad=False)
             log_gpu_memory_usage("After load actor params and grad during compute_log_prob", logger=logger)
+        is_lora = data.meta_info.pop("is_lora", False)
+        adapter_ctx = self.peft_cls.disable_adapter(self.actor_module) if is_lora else nullcontext()
         # we should always recompute old_log_probs when it is HybridEngine
-        data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
-        data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
-        data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
+        config_source = self.config.ref if is_lora else self.config.rollout
+        data.meta_info["micro_batch_size"] = config_source.log_prob_micro_batch_size_per_gpu
+        data.meta_info["max_token_len"] = config_source.log_prob_max_token_len_per_gpu
+        data.meta_info["use_dynamic_bsz"] = config_source.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
-        output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+        with adapter_ctx:
+            output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=not is_lora)
+        tensors = {"ref_log_prob": output} if is_lora else {"old_log_probs": output}
+        if not is_lora:
+            tensors["entropys"] = entropys
         output = DataProto.from_dict(
-            tensors={"old_log_probs": output, "entropys": entropys},
+            tensors=tensors,
             meta_info={"temperature": self.config.rollout.temperature},
         )
         output = output.to("cpu")
@@ -1028,7 +1064,9 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
             use_distributed_optimizer=self.config.megatron.use_distributed_optimizer,
             use_checkpoint_opt_param_scheduler=self.config.optim.use_checkpoint_opt_param_scheduler,
             bridge=self.bridge,
+            provider=self.provider,
             use_dist_checkpointing=self.config.megatron.use_dist_checkpointing,
+            peft_cls=self.peft_cls,
         )
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="critic"))

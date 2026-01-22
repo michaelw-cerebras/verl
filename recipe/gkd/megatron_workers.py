@@ -564,7 +564,9 @@ class MegatronOnPolicyDistillActorWorker(ActorRolloutRefWorker):
             use_distributed_optimizer=self.config.actor.megatron.use_distributed_optimizer,
             use_checkpoint_opt_param_scheduler=self.config.actor.optim.use_checkpoint_opt_param_scheduler,
             bridge=self.bridge,
+            provider=self.provider,
             use_dist_checkpointing=self.config.actor.megatron.use_dist_checkpointing,
+            peft_cls=self.peft_cls,
         )
         get_torch_device().empty_cache()
         log_gpu_memory_usage("Actor init_model finished", logger=logger)
