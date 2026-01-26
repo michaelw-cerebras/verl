@@ -239,7 +239,7 @@ def stats(
 
 
 
-# 保存math examples
+# save math examples
 path = "math_examples.jsonl.gz"
 # save_math_examples(path)
 df = stats(path, tokenizer_name="Qwen/Qwen3-0.6B", max_rows=None)
