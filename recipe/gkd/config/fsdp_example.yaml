@@ -1,0 +1,52 @@
+# Example configuration for GKD with FSDP backend
+# This is a minimal override config that switches from Megatron to FSDP
+#
+# Usage:
+#   python -m recipe.gkd.main_gkd \
+#       --config-name on_policy_distill_trainer \
+#       actor_rollout_ref.actor.strategy=fsdp \
+#       actor_rollout_ref.rollout.load_format=dummy_hf \
+#       ...
+#
+# Or use this file as a defaults override:
+#   python -m recipe.gkd.main_gkd \
+#       --config-path config \
+#       --config-name fsdp_example \
+#       ...
+
+defaults:
+  - on_policy_distill_trainer
+  - _self_
+
+# Override to use FSDP strategy instead of Megatron
+actor_rollout_ref:
+  actor:
+    strategy: fsdp  # Change from megatron to fsdp
+
+    # FSDP-specific config (already in base config, but shown here for clarity)
+    fsdp_config:
+      fsdp_size: -1  # All GPUs in one FSDP group (pure data parallel)
+      param_offload: false
+      optimizer_offload: false
+      model_dtype: bf16
+
+  rollout:
+    # For FSDP, use dummy_hf instead of dummy_megatron
+    load_format: dummy_hf
+
+
+# Notes for migration from Megatron to FSDP:
+#
+# 1. Change actor.strategy from "megatron" to "fsdp"
+# 2. Change rollout.load_format from "dummy_megatron" to "dummy_hf"
+# 3. FSDP does NOT need tensor_model_parallel_size or pipeline_model_parallel_size
+#    (these are Megatron-specific parallelism settings)
+# 4. FSDP uses fsdp_size to control sharding:
+#    - fsdp_size=-1: All GPUs in one group (recommended for smaller models)
+#    - fsdp_size=N: N GPUs per shard group (for larger models)
+#
+# Benefits of FSDP:
+# - Simpler setup and debugging
+# - Better LoRA support
+# - Works well with HuggingFace models
+# - Easier to integrate with other RL algorithms using FSDP (like GRPO)
