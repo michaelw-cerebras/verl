@@ -27,7 +27,15 @@ from verl.workers.reward_manager.abstract import AbstractRewardManager
 class NaiveRewardManager(AbstractRewardManager):
     """The reward manager."""
 
-    def __init__(self, tokenizer, num_examine, compute_score=None, reward_fn_key="data_source") -> None:
+    def __init__(
+        self,
+        tokenizer,
+        num_examine,
+        compute_score=None,
+        reward_fn_key="data_source",
+        max_resp_len=None,
+        overlong_buffer_cfg=None,
+    ) -> None:
         """
         Initialize the NaiveRewardManager instance.
 
@@ -37,11 +45,27 @@ class NaiveRewardManager(AbstractRewardManager):
             compute_score: A function to compute the reward score. If None, `default_compute_score` will be used.
             reward_fn_key: The key used to access the data source in the non-tensor batch data. Defaults to
                 "data_source".
+            max_resp_len: Maximum response length for overlong penalty calculation.
+            overlong_buffer_cfg: Configuration for overlong reward shaping. Should contain:
+                - enable: bool, whether to enable overlong penalty
+                - len: int, buffer length (penalty starts when response exceeds max_resp_len - len)
+                - penalty_factor: float, maximum penalty value
+                - log: bool, whether to log overlong metrics
         """
         self.tokenizer = tokenizer  # Store the tokenizer for decoding token IDs
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.compute_score = compute_score or default_compute_score
         self.reward_fn_key = reward_fn_key  # Store the key for accessing the data source
+        self.max_resp_len = max_resp_len
+        self.overlong_buffer_cfg = overlong_buffer_cfg
+
+        if self.overlong_buffer_cfg is not None and getattr(self.overlong_buffer_cfg, "enable", False):
+            assert self.max_resp_len is not None, (
+                f"max_resp_len must be provided if overlong_buffer_cfg is enabled, but got None"
+            )
+            assert self.max_resp_len >= self.overlong_buffer_cfg.len, (
+                "max_resp_len must be larger than overlong_buffer.len"
+            )
 
     def __call__(self, data: DataProto, return_dict: bool = False) -> torch.Tensor | dict[str, Any]:
         """We will expand this function gradually based on the available datasets"""
@@ -96,6 +120,18 @@ class NaiveRewardManager(AbstractRewardManager):
                     reward_extra_info[key].append(value)
             else:
                 reward = score
+
+            # Apply overlong penalty if configured
+            if self.overlong_buffer_cfg is not None and getattr(self.overlong_buffer_cfg, "enable", False):
+                overlong_buffer_len = self.overlong_buffer_cfg.len
+                expected_len = self.max_resp_len - overlong_buffer_len
+                exceed_len = valid_response_length - expected_len
+                overlong_penalty_factor = self.overlong_buffer_cfg.penalty_factor
+                overlong_reward = min(-exceed_len / overlong_buffer_len * overlong_penalty_factor, 0)
+                reward += overlong_reward
+                if getattr(self.overlong_buffer_cfg, "log", False):
+                    reward_extra_info["overlong_reward"].append(overlong_reward)
+                    reward_extra_info["overlong"].append(overlong_reward < 0)
 
             reward_tensor[i, valid_response_length - 1] = reward
 
