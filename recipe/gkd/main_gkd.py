@@ -159,8 +159,9 @@ class TaskRunner:
                 if not is_version_ge(pkg="vllm", minver="0.7.3"):
                     raise NotImplementedError("PPO LoRA is not supported before vllm 0.7.3")
 
-        # Megatron-only workers, split into rollout and actor
-        if config.actor_rollout_ref.actor.strategy == "megatron":
+        # Select workers based on strategy (megatron or fsdp)
+        strategy = config.actor_rollout_ref.actor.strategy
+        if strategy == "megatron":
             from verl.single_controller.ray import RayWorkerGroup
 
             from .megatron_workers import (
@@ -172,8 +173,20 @@ class TaskRunner:
             actor_cls = MegatronOnPolicyDistillActorWorker
             ray_worker_group_cls = RayWorkerGroup
 
+        elif strategy in ["fsdp", "fsdp2"]:
+            from verl.single_controller.ray import RayWorkerGroup
+
+            from .fsdp_workers import (
+                FSDPOnPolicyDistillActorWorker,
+                FSDPOnPolicyDistillRolloutWorker,
+            )
+
+            rollout_cls = FSDPOnPolicyDistillRolloutWorker
+            actor_cls = FSDPOnPolicyDistillActorWorker
+            ray_worker_group_cls = RayWorkerGroup
+
         else:
-            raise NotImplementedError
+            raise NotImplementedError(f"Unknown strategy: {strategy}. Supported: megatron, fsdp, fsdp2")
 
         # Worker mapping and resource pools
         from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role

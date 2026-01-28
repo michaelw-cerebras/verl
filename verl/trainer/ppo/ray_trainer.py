@@ -341,6 +341,26 @@ class RayPPOTrainer:
         if self.config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
+        # Initialize teacher client for GKD (Generalized Knowledge Distillation)
+        self.teacher_client = None
+        self.use_teacher_kl = getattr(self.config.actor_rollout_ref.actor, "use_teacher_kl_loss", False)
+        self.gkd_only_mode = getattr(self.config.actor_rollout_ref.actor, "gkd_only_mode", False)
+
+        if self.use_teacher_kl:
+            teacher_config = getattr(self.config.actor_rollout_ref, "teacher", None)
+            if teacher_config is not None:
+                from recipe.gkd.teacher.client import TeacherClient
+
+                self.teacher_client = TeacherClient(
+                    server_ip=teacher_config.server_ip,
+                    server_port=teacher_config.server_port,
+                    n_server_workers=getattr(teacher_config, "n_server_workers", 1),
+                    temperature=getattr(teacher_config, "temperature", 1.0),
+                )
+                print(f"[GKD] Initialized TeacherClient: {teacher_config.server_ip}:{teacher_config.server_port}")
+            else:
+                raise ValueError("use_teacher_kl_loss=True but no teacher config found in actor_rollout_ref.teacher")
+
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
@@ -1078,6 +1098,36 @@ class RayPPOTrainer:
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
+
+                    # ========== Get Teacher Knowledge for GKD ==========
+                    if self.use_teacher_kl and self.teacher_client is not None:
+                        with marked_timer("teacher_knowledge", timing_raw, color="orange"):
+                            from recipe.gkd.teacher_utils import get_teacher_knowledge
+
+                            teacher_config = self.config.actor_rollout_ref.teacher
+                            n_server_workers = getattr(teacher_config, "n_server_workers", 1)
+
+                            teacher_output = get_teacher_knowledge(
+                                batch=batch,
+                                teacher_client=self.teacher_client,
+                                n_server_workers=n_server_workers,
+                                is_async=False,
+                            )
+
+                            # Add teacher knowledge to batch
+                            # teacher_topk_logps and teacher_topk_indices are in non_tensor_batch
+                            batch.batch["teacher_topk_logps"] = torch.tensor(
+                                teacher_output.non_tensor_batch["teacher_topk_logps"],
+                                dtype=torch.float32,
+                            )
+                            batch.batch["teacher_topk_indices"] = torch.tensor(
+                                teacher_output.non_tensor_batch["teacher_topk_indices"],
+                                dtype=torch.long,
+                            )
+
+                            if "timing" in teacher_output.meta_info:
+                                timing_raw.update(teacher_output.meta_info["timing"])
+
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
@@ -1088,118 +1138,123 @@ class RayPPOTrainer:
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
-                    with marked_timer("reward", timing_raw, color="yellow"):
-                        # compute reward model score
-                        if self.use_rm and "rm_scores" not in batch.batch.keys():
-                            reward_tensor = self.rm_wg.compute_rm_score(batch)
-                            batch = batch.union(reward_tensor)
+                    # ========== Reward and Advantage Computation ==========
+                    # Skip in GKD-only mode (pure distillation without RL)
+                    reward_extra_infos_dict = {}  # Initialize for later use
 
-                        if self.config.reward_model.launch_reward_fn_async:
-                            future_reward = compute_reward_async.remote(
-                                data=batch, config=self.config, tokenizer=self.tokenizer
-                            )
-                        else:
-                            reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                    if not self.gkd_only_mode:
+                        with marked_timer("reward", timing_raw, color="yellow"):
+                            # compute reward model score
+                            if self.use_rm and "rm_scores" not in batch.batch.keys():
+                                reward_tensor = self.rm_wg.compute_rm_score(batch)
+                                batch = batch.union(reward_tensor)
 
-                    from verl.trainer.ppo.rollout_corr_helper import (
-                        compute_rollout_correction_and_add_to_batch,
-                        maybe_apply_rollout_correction,
-                    )
-
-                    rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
-                    need_recomputation = maybe_apply_rollout_correction(
-                        batch=batch,
-                        rollout_corr_config=rollout_corr_config,
-                        policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
-                    )
-                    if need_recomputation:
-                        # LEGACY MODE: Compute old_log_probs from actor
-                        with marked_timer("old_log_prob", timing_raw, color="blue"):
-                            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                            entropys = old_log_prob.batch["entropys"]
-                            response_masks = batch.batch["response_mask"]
-                            loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                            entropy_agg = agg_loss(
-                                loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode
-                            )
-                            old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
-                            metrics.update(old_log_prob_metrics)
-                            old_log_prob.batch.pop("entropys")
-                            batch = batch.union(old_log_prob)
-                            if "rollout_log_probs" in batch.batch.keys():
-                                # TODO: we may want to add diff of probs too.
-                                from verl.utils.debug.metrics import calculate_debug_metrics
-
-                                metrics.update(calculate_debug_metrics(batch))
-
-                    assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
-
-                    if self.use_reference_policy:
-                        # compute reference log_prob
-                        with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
-                            if not self.ref_in_actor:
-                                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                            if self.config.reward_model.launch_reward_fn_async:
+                                future_reward = compute_reward_async.remote(
+                                    data=batch, config=self.config, tokenizer=self.tokenizer
+                                )
                             else:
-                                ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
-                            batch = batch.union(ref_log_prob)
+                                reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
-                    # compute values
-                    if self.use_critic:
-                        with marked_timer("values", timing_raw, color="cyan"):
-                            values = self.critic_wg.compute_values(batch)
-                            batch = batch.union(values)
-
-                    with marked_timer("adv", timing_raw, color="brown"):
-                        # we combine with rule-based rm
-                        reward_extra_infos_dict: dict[str, list]
-                        if self.config.reward_model.launch_reward_fn_async:
-                            reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
-                        batch.batch["token_level_scores"] = reward_tensor
-
-                        if reward_extra_infos_dict:
-                            batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
-
-                        # compute rewards. apply_kl_penalty if available
-                        if self.config.algorithm.use_kl_in_reward:
-                            batch, kl_metrics = apply_kl_penalty(
-                                batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
-                            )
-                            metrics.update(kl_metrics)
-                        else:
-                            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
-
-                        # Compute rollout correction weights centrally (once per batch)
-                        # This corrects for off-policy issues (policy mismatch, model staleness, etc.)
-                        # Also computes off-policy diagnostic metrics (KL, PPL, etc.)
-                        if rollout_corr_config is not None and "rollout_log_probs" in batch.batch:
-                            batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch)
-                            # IS and off-policy metrics already have rollout_corr/ prefix
-                            metrics.update(is_metrics)
-
-                        # compute advantages, executed on the driver process
-                        norm_adv_by_std_in_grpo = self.config.algorithm.get(
-                            "norm_adv_by_std_in_grpo", True
-                        )  # GRPO adv normalization factor
-
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            config=self.config.algorithm,
+                        from verl.trainer.ppo.rollout_corr_helper import (
+                            compute_rollout_correction_and_add_to_batch,
+                            maybe_apply_rollout_correction,
                         )
 
-                    # update critic
-                    if self.use_critic:
+                        rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+                        need_recomputation = maybe_apply_rollout_correction(
+                            batch=batch,
+                            rollout_corr_config=rollout_corr_config,
+                            policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
+                        )
+                        if need_recomputation:
+                            # LEGACY MODE: Compute old_log_probs from actor
+                            with marked_timer("old_log_prob", timing_raw, color="blue"):
+                                old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                                entropys = old_log_prob.batch["entropys"]
+                                response_masks = batch.batch["response_mask"]
+                                loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                                entropy_agg = agg_loss(
+                                    loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode
+                                )
+                                old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
+                                metrics.update(old_log_prob_metrics)
+                                old_log_prob.batch.pop("entropys")
+                                batch = batch.union(old_log_prob)
+                                if "rollout_log_probs" in batch.batch.keys():
+                                    # TODO: we may want to add diff of probs too.
+                                    from verl.utils.debug.metrics import calculate_debug_metrics
+
+                                    metrics.update(calculate_debug_metrics(batch))
+
+                        assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
+
+                        if self.use_reference_policy:
+                            # compute reference log_prob
+                            with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
+                                if not self.ref_in_actor:
+                                    ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                                else:
+                                    ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
+                                batch = batch.union(ref_log_prob)
+
+                        # compute values
+                        if self.use_critic:
+                            with marked_timer("values", timing_raw, color="cyan"):
+                                values = self.critic_wg.compute_values(batch)
+                                batch = batch.union(values)
+
+                        with marked_timer("adv", timing_raw, color="brown"):
+                            # we combine with rule-based rm
+                            if self.config.reward_model.launch_reward_fn_async:
+                                reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+                            batch.batch["token_level_scores"] = reward_tensor
+
+                            if reward_extra_infos_dict:
+                                batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+
+                            # compute rewards. apply_kl_penalty if available
+                            if self.config.algorithm.use_kl_in_reward:
+                                batch, kl_metrics = apply_kl_penalty(
+                                    batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
+                                )
+                                metrics.update(kl_metrics)
+                            else:
+                                batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+                            # Compute rollout correction weights centrally (once per batch)
+                            # This corrects for off-policy issues (policy mismatch, model staleness, etc.)
+                            # Also computes off-policy diagnostic metrics (KL, PPL, etc.)
+                            rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+                            if rollout_corr_config is not None and "rollout_log_probs" in batch.batch:
+                                batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch)
+                                # IS and off-policy metrics already have rollout_corr/ prefix
+                                metrics.update(is_metrics)
+
+                            # compute advantages, executed on the driver process
+                            norm_adv_by_std_in_grpo = self.config.algorithm.get(
+                                "norm_adv_by_std_in_grpo", True
+                            )  # GRPO adv normalization factor
+
+                            batch = compute_advantage(
+                                batch,
+                                adv_estimator=self.config.algorithm.adv_estimator,
+                                gamma=self.config.algorithm.gamma,
+                                lam=self.config.algorithm.lam,
+                                num_repeat=self.config.actor_rollout_ref.rollout.n,
+                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                                config=self.config.algorithm,
+                            )
+
+                    # update critic (skip in GKD-only mode)
+                    if self.use_critic and not self.gkd_only_mode:
                         with marked_timer("update_critic", timing_raw, color="pink"):
                             critic_output = self.critic_wg.update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
 
-                    # implement critic warmup
-                    if self.config.trainer.critic_warmup <= self.global_steps:
+                    # implement critic warmup (or skip warmup check in GKD-only mode)
+                    if self.gkd_only_mode or self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
