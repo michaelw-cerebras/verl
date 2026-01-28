@@ -1,0 +1,100 @@
+# Example configuration for GKD (Generalized Knowledge Distillation) with FSDP backend
+# This configuration integrates teacher distillation into the PPO trainer
+#
+# Key features:
+# - Uses FSDP backend for training (simpler, better LoRA support)
+# - Supports pure GKD mode (gkd_only_mode=true) or hybrid GKD+RL mode
+# - Teacher model runs as a separate vLLM server
+#
+# Usage:
+#   1. Start teacher server first:
+#      python -m recipe.gkd.teacher.server --model_path /path/to/teacher
+#
+#   2. Run training:
+#      python -m verl.trainer.main_ppo \
+#          --config-path /path/to/this/config \
+#          --config-name gkd_fsdp_example
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+# Model configuration
+actor_rollout_ref:
+  model:
+    path: /path/to/student_model
+    use_remove_padding: false  # Required: GKD needs logits, which requires remove_padding=false
+
+  actor:
+    strategy: fsdp
+
+    # ========== GKD Configuration ==========
+    # Enable teacher KL loss (distillation from teacher)
+    use_teacher_kl_loss: true
+
+    # Coefficient for teacher KL loss
+    teacher_kl_coef: 1.0
+
+    # Temperature for teacher KL loss (higher = softer distribution)
+    teacher_kl_temperature: 1.0
+
+    # GKD-only mode: only use teacher KL loss, skip RL (reward/advantage)
+    # Set to true for pure distillation, false for hybrid GKD+RL
+    gkd_only_mode: true
+
+    # FSDP config
+    fsdp_config:
+      fsdp_size: -1
+      param_offload: false
+      optimizer_offload: false
+
+    optim:
+      lr: 1e-5
+      weight_decay: 0.01
+
+  # ========== Teacher Configuration ==========
+  teacher:
+    # Teacher server address (vLLM server)
+    server_ip: localhost
+    server_port: 15555
+
+    # Number of parallel workers for teacher inference
+    n_server_workers: 1
+
+    # Temperature for teacher logits
+    temperature: 1.0
+
+  rollout:
+    name: vllm
+    load_format: dummy_hf  # For FSDP, use dummy_hf instead of dummy_megatron
+    temperature: 1.0
+    tensor_model_parallel_size: 1
+
+# Algorithm configuration
+algorithm:
+  # In GKD-only mode, these are not used but kept for compatibility
+  adv_estimator: grpo
+  use_kl_in_reward: false
+
+# Data configuration
+data:
+  train_files: /path/to/train.parquet
+  val_files: null
+  max_prompt_length: 512
+  max_response_length: 512
+  train_batch_size: 32
+
+# Trainer configuration
+trainer:
+  total_epochs: 10
+  n_gpus_per_node: 4
+  nnodes: 1
+  save_freq: -1
+  test_freq: 100
+  project_name: gkd_fsdp
+  experiment_name: test
+
+# Rollout configuration
+rollout:
+  n_gpus_per_node: 4
+  nnodes: 1
