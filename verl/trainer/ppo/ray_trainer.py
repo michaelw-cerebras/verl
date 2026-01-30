@@ -22,6 +22,7 @@ import json
 import os
 import random
 import uuid
+import time
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -1271,6 +1272,7 @@ class RayPPOTrainer:
             )
 
             is_last_step = self.global_steps >= self.total_training_steps
+            step_wall_t0 = time.perf_counter()
             with marked_timer("step", timing_raw):
                 # ========== Handle On-Policy vs Off-Policy ==========
                 if is_on_policy:
@@ -1352,6 +1354,25 @@ class RayPPOTrainer:
                             n_server_workers=n_server_workers,
                             is_async=False,
                         )
+                        # ===== Keep only response tokens for teacher KL =====
+                        T_resp = int(self.config.data.max_response_length)
+
+                        # teacher_output stores these in non_tensor_batch as numpy arrays
+                        t_idx = teacher_output.non_tensor_batch["teacher_topk_indices"]  # shape [B, 1024, K]
+                        t_logps = teacher_output.non_tensor_batch["teacher_topk_logps"]  # shape [B, 1024, K]
+
+                        # We only distill on response tokens.
+                        # Student logits for response are aligned as logits[:, -T_resp-1:-1] (next-token prediction).
+                        # So teacher topk must use the same source positions: [-T_resp-1:-1], NOT [-T_resp:].
+                        teacher_output.non_tensor_batch["teacher_topk_indices"] = t_idx[:, -(T_resp + 1):-1, :]
+                        teacher_output.non_tensor_batch["teacher_topk_logps"]   = t_logps[:, -(T_resp + 1):-1, :]
+
+                        # response_mask remains response-token mask (length T_resp)
+                        batch.batch["response_mask"] = batch.batch["response_mask"][:, -T_resp:]
+
+                        assert teacher_output.non_tensor_batch["teacher_topk_indices"].shape[1] == T_resp
+                        assert teacher_output.non_tensor_batch["teacher_topk_logps"].shape[1] == T_resp
+                        assert batch.batch["response_mask"].shape[1] == T_resp
 
                         # Add teacher knowledge to batch
                         # teacher_topk_logps and teacher_topk_indices are in non_tensor_batch
@@ -1508,6 +1529,7 @@ class RayPPOTrainer:
                 if self.gkd_only_mode or self.config.trainer.critic_warmup <= self.global_steps:
                     # update actor
                     with marked_timer("update_actor", timing_raw, color="red"):
+                        batch.meta_info.setdefault("temperature", float(self.config.actor_rollout_ref.rollout.temperature))
                         batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                         actor_output = self.actor_rollout_wg.update_actor(batch)
                     actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
@@ -1564,49 +1586,94 @@ class RayPPOTrainer:
                     prev_step_profile = curr_step_profile
                     curr_step_profile = next_step_profile
 
-                steps_duration = timing_raw["step"]
-                self.max_steps_duration = max(self.max_steps_duration, steps_duration)
+            step_wall = time.perf_counter() - step_wall_t0
+            # steps_duration = timing_raw["step"]
+            if "step" not in timing_raw:
+                # fallback to real wall-clock time for this step
+                timing_raw["step"] = float(step_wall)
 
-                # training metrics
-                metrics.update(
-                    {
-                        "training/global_step": self.global_steps,
-                        "training/epoch": epoch,
-                    }
+            steps_duration = float(timing_raw["step"])
+
+            self.max_steps_duration = max(self.max_steps_duration, steps_duration)
+
+            # training metrics
+            metrics.update(
+                {
+                    "training/global_step": self.global_steps,
+                    "training/epoch": epoch,
+                }
+            )
+
+            # ===== gkd-only fallback: metric_utils expects token_level_scores =====
+            if self.gkd_only_mode:
+                self._ensure_rl_metric_keys(batch)
+
+            # collect metrics
+            metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+            metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+            # TODO: implement actual tflpo and theoretical tflpo
+            n_gpus = self.resource_pool_manager.get_n_gpus()
+            metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+            # Note: mismatch metrics (KL, PPL, etc.) are collected at line 1179 after advantage computation
+
+            # this is experimental and may be changed/removed in the future in favor of a general-purpose one
+            if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
+                self.train_dataloader.sampler.update(batch=batch)
+
+            # TODO: make a canonical logger that supports various backend
+            logger.log(data=metrics, step=self.global_steps)
+
+            progress_bar.update(1)
+            self.global_steps += 1
+
+            if (
+                hasattr(self.config.actor_rollout_ref.actor, "profiler")
+                and self.config.actor_rollout_ref.actor.profiler.tool == "torch_memory"
+            ):
+                self.actor_rollout_wg.dump_memory_snapshot(
+                    tag=f"post_update_step{self.global_steps}", sub_dir=f"step{self.global_steps}"
                 )
-                # collect metrics
-                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
-                metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
-                # TODO: implement actual tflpo and theoretical tflpo
-                n_gpus = self.resource_pool_manager.get_n_gpus()
-                metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
-                # Note: mismatch metrics (KL, PPL, etc.) are collected at line 1179 after advantage computation
 
-                # this is experimental and may be changed/removed in the future in favor of a general-purpose one
-                if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
-                    self.train_dataloader.sampler.update(batch=batch)
+            if is_last_step:
+                pprint(f"Final validation metrics: {last_val_metrics}")
+                progress_bar.close()
+                return
 
-                # TODO: make a canonical logger that supports various backend
-                logger.log(data=metrics, step=self.global_steps)
+            # this is experimental and may be changed/removed in the future
+            # in favor of a general-purpose data buffer pool
+            if hasattr(self.train_dataset, "on_batch_end"):
+                # The dataset may be changed after each training batch
+                self.train_dataset.on_batch_end(batch=batch)
 
-                progress_bar.update(1)
-                self.global_steps += 1
+    def _ensure_rl_metric_keys(self, batch):
+        """
+        In gkd_only_mode we skip reward/advantage/rl pipeline, but metric_utils
+        assumes RL keys exist. Create zero placeholders to make logging robust.
+        """
+        import torch
 
-                if (
-                    hasattr(self.config.actor_rollout_ref.actor, "profiler")
-                    and self.config.actor_rollout_ref.actor.profiler.tool == "torch_memory"
-                ):
-                    self.actor_rollout_wg.dump_memory_snapshot(
-                        tag=f"post_update_step{self.global_steps}", sub_dir=f"step{self.global_steps}"
-                    )
+        assert "response_mask" in batch.batch.keys()
+        resp_mask = batch.batch["response_mask"]              # (B, T_resp), dtype usually bool/int
+        B, T = resp_mask.shape
 
-                if is_last_step:
-                    pprint(f"Final validation metrics: {last_val_metrics}")
-                    progress_bar.close()
-                    return
+        # canonical float tensor shape for token-level metrics
+        zeros_f = torch.zeros((B, T), device=resp_mask.device, dtype=torch.float32)
 
-                # this is experimental and may be changed/removed in the future
-                # in favor of a general-purpose data buffer pool
-                if hasattr(self.train_dataset, "on_batch_end"):
-                    # The dataset may be changed after each training batch
-                    self.train_dataset.on_batch_end(batch=batch)
+        # --- token-level rewards/scores ---
+        batch.batch.setdefault("token_level_scores", zeros_f)
+        batch.batch.setdefault("token_level_rewards", zeros_f)
+
+        # --- advantage/returns (metric_utils often reads these) ---
+        batch.batch.setdefault("advantages", zeros_f)
+        batch.batch.setdefault("returns", zeros_f)
+
+        # --- logprobs (sometimes used for KL / entropy metrics) ---
+        # Keep them around even if not used; safe default = 0
+        batch.batch.setdefault("old_log_probs", zeros_f)
+        batch.batch.setdefault("ref_log_prob", zeros_f)
+
+        # --- values (only if some metric path expects it) ---
+        batch.batch.setdefault("values", zeros_f)
+
+        # --- optional: entropy per token (some code paths compute masked mean) ---
+        batch.batch.setdefault("entropys", zeros_f)

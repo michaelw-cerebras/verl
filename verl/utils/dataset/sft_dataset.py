@@ -141,6 +141,47 @@ class SFTDataset(Dataset):
             self.responses = self.responses.squeeze()
         self.responses = self.responses.tolist()
 
+        # -------------------------
+        # [ADD] Drop over-length samples (discard examples where prompt+response > max_length)
+        # NOTE: This keeps your original code intact; we only filter after prompts/responses are materialized.
+        # -------------------------
+        dropped = 0
+        keep_indices = []
+
+        # local refs for speed
+        tokenizer = self.tokenizer
+        max_length = self.max_length
+
+        for i, (prompt, response) in enumerate(zip(self.prompts, self.responses)):
+            # apply chat template (same as __getitem__)
+            prompt_chat = [{"role": "user", "content": prompt}]
+            prompt_chat_str = tokenizer.apply_chat_template(
+                prompt_chat,
+                add_generation_prompt=True,
+                tokenize=False,
+                **self.apply_chat_template_kwargs,
+            )
+            response_chat_str = response + tokenizer.eos_token
+
+            # estimate token lengths (no tensors)
+            prompt_len = len(tokenizer(prompt_chat_str, add_special_tokens=False).input_ids)
+            resp_len = len(tokenizer(response_chat_str, add_special_tokens=False).input_ids)
+
+            if prompt_len + resp_len <= max_length:
+                keep_indices.append(i)
+            else:
+                dropped += 1
+
+        if dropped > 0:
+            print(f"[SFTDataset] dropped {dropped}/{len(self.prompts)} samples with length > max_length={max_length}")
+
+            # filter dataframe/prompts/responses consistently
+            self.dataframe = self.dataframe.iloc[keep_indices].reset_index(drop=True)
+            self.prompts = [self.prompts[i] for i in keep_indices]
+            self.responses = [self.responses[i] for i in keep_indices]
+
+
+
     def __len__(self):
         return len(self.prompts)
 

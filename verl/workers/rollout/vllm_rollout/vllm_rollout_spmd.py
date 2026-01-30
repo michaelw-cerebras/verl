@@ -122,6 +122,16 @@ def _check_vllm_version_for_sleep_level():
     return vs.parse(current_version) >= vs.parse(minver)
 
 
+# helper: support both dict-like and dataclass-like config
+def _items(cfg):
+    return cfg.items() if hasattr(cfg, "items") else vars(cfg).items()
+
+def _get(cfg, k, default=None):
+    if hasattr(cfg, "get"):
+        return cfg.get(k, default)
+    return getattr(cfg, k, default)
+
+
 class vLLMRollout(BaseRollout):
     def __init__(
         self,
@@ -252,20 +262,49 @@ class vLLMRollout(BaseRollout):
             **engine_kwargs,
         )
 
+
         kwargs = dict(
             n=1,
             logprobs=0,  # can be set to 0 and let actor to recompute
-            max_tokens=config.response_length,
-            repetition_penalty=config.get("repetition_penalty", 1.0),
+            max_tokens=_get(config, "response_length"),
+            detokenize=False,
         )
 
-        kwargs["detokenize"] = False
+        # --- explicitly support these fields (the ones you asked) ---
+        # 1) stop_token_ids
+        stop_token_ids = _get(config, "stop_token_ids", None)
+        if stop_token_ids is not None:
+            kwargs["stop_token_ids"] = stop_token_ids
+
+        # 2) repetition_penalty
+        rep = _get(config, "repetition_penalty", None)
+        if rep is not None:
+            kwargs["repetition_penalty"] = rep
+
+        # 3) presence_penalty / frequency_penalty (optional but usually useful)
+        presence = _get(config, "presence_penalty", None)
+        if presence is not None:
+            kwargs["presence_penalty"] = presence
+
+        freq = _get(config, "frequency_penalty", None)
+        if freq is not None:
+            kwargs["frequency_penalty"] = freq
 
         # supporting adding any sampling params from the config file
-        for k in config.keys():
-            if hasattr(SamplingParams(), str(k)) and k != "seed":
-                kwargs[k] = config.get(k)
+        # (use SamplingParams(max_tokens=1) to avoid vLLM versions where SamplingParams() needs args)
+        _sp = SamplingParams(max_tokens=1)
+        for k, v in _items(config):
+            if v is None or k == "seed":
+                continue
+            if hasattr(_sp, str(k)):
+                kwargs[k] = v
+
+        # enforce final values (avoid accidental overrides)
         kwargs["n"] = 1  # already repeat in ray_trainer
+        kwargs["max_tokens"] = _get(config, "response_length")
+        kwargs["detokenize"] = False
+        kwargs["logprobs"] = 0
+
         print(f"kwargs: {kwargs}")
         self.sampling_params = SamplingParams(**kwargs)
 
