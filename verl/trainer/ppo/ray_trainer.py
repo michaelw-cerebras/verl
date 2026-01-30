@@ -353,6 +353,15 @@ class RayPPOTrainer:
         # Clamp lambda to [0, 1]
         self.gkd_lambda = max(0.0, min(1.0, self.gkd_lambda))
 
+        # GKD selection strategy for GRPO + GKD mode (when rollout.n > 1)
+        # Options: "all", "random", "best", "worst"
+        # - all: teacher KL on all n responses
+        # - random: teacher KL on random k responses
+        # - best: teacher KL on top-k responses by reward
+        # - worst: teacher KL on bottom-k responses by reward
+        self.gkd_select_strategy = self.config.actor_rollout_ref.actor.get("gkd_select_strategy", "all")
+        self.gkd_select_k = self.config.actor_rollout_ref.actor.get("gkd_select_k", 1)
+
         if self.use_teacher_kl:
             teacher_config = getattr(self.config.actor_rollout_ref, "teacher", None)
             if teacher_config is not None:
@@ -582,6 +591,79 @@ class RayPPOTrainer:
                     batch_dict = next(off_it)
                     batch_dict["is_on_policy"] = False
                 yield epoch, batch_dict
+
+    def _compute_gkd_select_mask(self, batch: DataProto, n_repeat: int) -> torch.Tensor:
+        """
+        Compute a boolean mask indicating which samples should have teacher KL loss applied.
+
+        For GRPO + GKD mode, we may want to only apply teacher KL on a subset of the n responses
+        per prompt, based on the selection strategy.
+
+        Args:
+            batch: DataProto containing the batch data (with rewards if available)
+            n_repeat: Number of responses per prompt (rollout.n)
+
+        Returns:
+            Boolean tensor of shape (batch_size,) where True means apply teacher KL
+        """
+        batch_size = len(batch.batch["input_ids"])
+        strategy = self.gkd_select_strategy
+        k = min(self.gkd_select_k, n_repeat)  # Can't select more than n
+
+        # For gkd_only_mode or n=1, always use all
+        if self.gkd_only_mode or n_repeat == 1:
+            return torch.ones(batch_size, dtype=torch.bool)
+
+        if strategy == "all":
+            return torch.ones(batch_size, dtype=torch.bool)
+
+        # Number of prompts (each prompt has n_repeat responses)
+        n_prompts = batch_size // n_repeat
+        mask = torch.zeros(batch_size, dtype=torch.bool)
+
+        if strategy == "random":
+            # Randomly select k responses per prompt
+            for i in range(n_prompts):
+                start_idx = i * n_repeat
+                selected = random.sample(range(n_repeat), k)
+                for s in selected:
+                    mask[start_idx + s] = True
+
+        elif strategy == "best":
+            # Select top-k responses by reward per prompt
+            if "token_level_scores" not in batch.batch:
+                # No rewards available, fall back to all
+                print("[GKD] Warning: 'best' strategy requires rewards, falling back to 'all'")
+                return torch.ones(batch_size, dtype=torch.bool)
+
+            rewards = batch.batch["token_level_scores"].sum(dim=-1)  # (batch_size,)
+            for i in range(n_prompts):
+                start_idx = i * n_repeat
+                end_idx = start_idx + n_repeat
+                group_rewards = rewards[start_idx:end_idx]
+                _, topk_indices = torch.topk(group_rewards, k)
+                for idx in topk_indices:
+                    mask[start_idx + idx] = True
+
+        elif strategy == "worst":
+            # Select bottom-k responses by reward per prompt
+            if "token_level_scores" not in batch.batch:
+                # No rewards available, fall back to all
+                print("[GKD] Warning: 'worst' strategy requires rewards, falling back to 'all'")
+                return torch.ones(batch_size, dtype=torch.bool)
+
+            rewards = batch.batch["token_level_scores"].sum(dim=-1)  # (batch_size,)
+            for i in range(n_prompts):
+                start_idx = i * n_repeat
+                end_idx = start_idx + n_repeat
+                group_rewards = rewards[start_idx:end_idx]
+                _, bottomk_indices = torch.topk(group_rewards, k, largest=False)
+                for idx in bottomk_indices:
+                    mask[start_idx + idx] = True
+        else:
+            raise ValueError(f"Unknown gkd_select_strategy: {strategy}")
+
+        return mask
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""
@@ -1402,6 +1484,18 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+
+                # ========== Compute GKD Selection Mask (for GRPO + GKD mode) ==========
+                if self.use_teacher_kl and not self.gkd_only_mode:
+                    n_repeat = self.config.actor_rollout_ref.rollout.n
+                    gkd_select_mask = self._compute_gkd_select_mask(batch, n_repeat)
+                    batch.batch["gkd_select_mask"] = gkd_select_mask
+
+                    # Log selection statistics
+                    n_selected = gkd_select_mask.sum().item()
+                    n_total = len(gkd_select_mask)
+                    metrics["gkd/select_ratio"] = n_selected / n_total
+                    metrics["gkd/select_strategy"] = self.gkd_select_strategy
 
                 # update critic (skip in GKD-only mode)
                 if self.use_critic and not self.gkd_only_mode:

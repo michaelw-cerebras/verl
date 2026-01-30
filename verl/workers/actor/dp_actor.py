@@ -407,6 +407,9 @@ class DataParallelPPOActor(BasePPOActor):
         # Include teacher knowledge if using teacher KL loss (GKD)
         if use_teacher_kl_loss:
             select_keys.extend(["teacher_topk_logps", "teacher_topk_indices"])
+            # Include GKD selection mask if present (for GRPO + GKD mode)
+            if "gkd_select_mask" in data.batch.keys():
+                select_keys.append("gkd_select_mask")
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
@@ -554,8 +557,18 @@ class DataParallelPPOActor(BasePPOActor):
                             response_mask=response_mask,
                             temperature=getattr(self.config, "teacher_kl_temperature", 1.0),
                         )
+
+                        # Apply GKD selection mask if present (for GRPO + GKD mode)
+                        # This allows selective teacher KL on best/worst/random responses
+                        gkd_kl_mask = response_mask
+                        if "gkd_select_mask" in model_inputs:
+                            gkd_select_mask = model_inputs["gkd_select_mask"]  # (batch_size,)
+                            # Expand mask to match response_mask shape: (batch_size, seq_len)
+                            gkd_select_mask_expanded = gkd_select_mask.unsqueeze(-1).expand_as(response_mask)
+                            gkd_kl_mask = response_mask * gkd_select_mask_expanded
+
                         teacher_kl_loss = agg_loss(
-                            loss_mat=teacher_kl, loss_mask=response_mask, loss_agg_mode=loss_agg_mode
+                            loss_mat=teacher_kl, loss_mask=gkd_kl_mask, loss_agg_mode=loss_agg_mode
                         )
 
                         teacher_kl_coef = getattr(self.config, "teacher_kl_coef", 1.0)
