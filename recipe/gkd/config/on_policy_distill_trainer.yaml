@@ -69,8 +69,42 @@ actor_rollout_ref:
     trust_remote_code: False
   actor:
     # Whether to automatically adjust batch size at runtime
+    # Options: megatron, fsdp, fsdp2
+    # - megatron: Megatron backend with tensor/pipeline parallelism (for large models)
+    # - fsdp: PyTorch FSDP backend (recommended for smaller models, easier debugging, better LoRA support)
+    # - fsdp2: PyTorch FSDP2 backend (experimental)
     strategy: megatron
     micro_batch_size: 2
+
+    # FSDP configuration (used when strategy is fsdp or fsdp2)
+    fsdp_config:
+      _target_: verl.workers.config.FSDPEngineConfig
+      # Policy for wrapping the model
+      wrap_policy:
+        min_num_params: 0
+      # Whether to offload model parameters to CPU
+      param_offload: false
+      # Whether to offload optimizer state to CPU
+      optimizer_offload: false
+      # Only for FSDP2: offload param/grad/optimizer during train
+      offload_policy: false
+      # Only for FSDP2: Reshard after forward pass to reduce memory footprint
+      reshard_after_forward: true
+      # Number of GPUs in each FSDP shard group; -1 means auto (all GPUs in one group)
+      fsdp_size: -1
+      # Only for FSDP1: prefetch the next forward-pass all-gather
+      forward_prefetch: false
+      # Model dtype for FSDP
+      model_dtype: bf16
+      # Whether to use original parameters in FSDP1
+      use_orig_params: false
+      # Mixed precision configuration
+      mixed_precision:
+        param_dtype: bf16
+        reduce_dtype: fp32
+        buffer_dtype: fp32
+
+    # Megatron configuration (used when strategy is megatron)
     megatron:
       param_offload: False
       grad_offload: False
@@ -208,6 +242,8 @@ actor_rollout_ref:
     ignore_eos: False
     enforce_eager: True
     free_cache_engine: True
+    # For megatron strategy: use dummy_megatron
+    # For fsdp strategy: use dummy_hf or auto
     load_format: dummy_megatron
     tensor_model_parallel_size: 1
     max_num_batched_tokens: 8192
