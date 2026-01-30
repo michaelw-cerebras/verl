@@ -1362,12 +1362,14 @@ class RayPPOTrainer:
                         t_logps = teacher_output.non_tensor_batch["teacher_topk_logps"]  # shape [B, 1024, K]
 
                         # We only distill on response tokens.
-                        # In your setup, response tokens are the last T_resp positions of the merged (prompt+response) sequence.
-                        teacher_output.non_tensor_batch["teacher_topk_indices"] = t_idx[:, -T_resp:, :]
-                        teacher_output.non_tensor_batch["teacher_topk_logps"]   = t_logps[:, -T_resp:, :]
+                        # Student logits for response are aligned as logits[:, -T_resp-1:-1] (next-token prediction).
+                        # So teacher topk must use the same source positions: [-T_resp-1:-1], NOT [-T_resp:].
+                        teacher_output.non_tensor_batch["teacher_topk_indices"] = t_idx[:, -(T_resp + 1):-1, :]
+                        teacher_output.non_tensor_batch["teacher_topk_logps"]   = t_logps[:, -(T_resp + 1):-1, :]
 
-                        # Also shrink response_mask to match the response-only axis used by student logits
+                        # response_mask remains response-token mask (length T_resp)
                         batch.batch["response_mask"] = batch.batch["response_mask"][:, -T_resp:]
+
                         assert teacher_output.non_tensor_batch["teacher_topk_indices"].shape[1] == T_resp
                         assert teacher_output.non_tensor_batch["teacher_topk_logps"].shape[1] == T_resp
                         assert batch.batch["response_mask"].shape[1] == T_resp

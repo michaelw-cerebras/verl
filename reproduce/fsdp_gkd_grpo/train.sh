@@ -95,7 +95,6 @@ args=(
   actor_rollout_ref.rollout.temperature=0.6
   actor_rollout_ref.rollout.top_p=0.95
   # ++actor_rollout_ref.rollout.stop_token_ids='[151645,151643]' # this is for qwen3, turn it off for qwen2
-  ++actor_rollout_ref.rollout.stop_token_ids='[151643]'
   critic.model.path=Qwen/Qwen2.5-0.5B-Instruct
 
   # ====== Trainer ======
