@@ -1,7 +1,7 @@
 GPUS="4,5,6,7"
 export CUDA_VISIBLE_DEVICES="$GPUS"
 
-# rm -rf wandb
+rm -rf wandb
 rm -f eval*log
 
 echo "[pre] HARD reset GPUs: $GPUS"

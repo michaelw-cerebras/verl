@@ -1207,30 +1207,43 @@ def main() -> None:
 
             wandb_run = wandb.init(**wandb_kwargs)
 
-            # Create a *new* eval namespace that uses our own step axis.
-            # This preserves any historical charts that use W&B's default internal Step.
-            # New eval metrics will live under `eval/*` and use `eval/global_step` as X.
-            # We log with `step=<global_step>` below so W&B's internal Step matches training steps.
-            # Keeping this define lets you select `eval/global_step` as X-axis, but we
-            # intentionally do NOT force all metrics to use it (forcing breaks old history).
-            wandb.define_metric("eval/global_step")
-
             wandb.config.update({
-                "pass_k": args.pass_k,
-                "temperature": args.temperature,
-                "top_p": args.top_p,
-                "max_tokens": args.max_tokens,
-                "batch_size": args.batch_size,
-                "num_samples": args.num_samples,
-                "seed": args.seed,
-                "step0_model": args.step0_model,
-            })
+                "eval_pass_k": args.pass_k,
+                "eval_temperature": args.temperature,
+                "eval_num_samples": args.num_samples,
+            }, allow_val_change=True)
         except ImportError:
             print("\nWarning: wandb not installed, skipping W&B logging")
             wandb_run = None
         except Exception as e:
             print(f"\nWarning: W&B init failed: {e}")
             wandb_run = None
+
+    # If we have existing results and W&B is enabled, log them to W&B
+    # so the curve shows all checkpoints (not just newly evaluated ones).
+    if wandb_run is not None and results:
+        import wandb  # type: ignore
+        print(f"\n[wandb] logging {len(results)} existing results to W&B...")
+        # Sort by step to ensure correct order
+        sorted_results = sorted(results, key=lambda r: r.step if r.step is not None else -1)
+
+        # Create a custom line plot that auto-appears in dashboard
+        table_data = []
+        for r in sorted_results:
+            checkpoint_step = 0 if r.step is None else int(r.step)
+            table_data.append([checkpoint_step, r.acc, r.n])
+
+        table = wandb.Table(
+            data=table_data,
+            columns=["checkpoint_step", "accuracy", "n_samples"]
+        )
+        wandb.log({
+            f"eval/pass@{args.pass_k}_curve": wandb.plot.line(
+                table, "checkpoint_step", "accuracy",
+                title=f"Pass@{args.pass_k} Accuracy vs Checkpoint"
+            )
+        })
+        print(f"[wandb] done logging existing results")
 
     # Best-effort: flush progress on Ctrl+C / SIGTERM so we can resume.
     def _on_signal(signum, frame):
@@ -1258,17 +1271,6 @@ def main() -> None:
         results.append(r0_er)
         _flush_progress(args, results)
 
-        if wandb_run is not None:
-            import wandb  # type: ignore
-            wandb.log({
-                f"eval/pass@{args.pass_k}/accuracy": r0_er.acc,
-                f"eval/pass@{args.pass_k}/n_samples": r0_er.n,
-                "eval/global_step": 0,
-                "global_step": 0,
-                "eval/label": r0_er.label,
-                "eval/model": r0_er.model,
-            }, step=0)
-
     print("\n=== Evaluating checkpoints ===")
     for c in ckpts:
         label = f"global_step_{c.step}"
@@ -1288,18 +1290,6 @@ def main() -> None:
         results.append(er)
         _flush_progress(args, results)
 
-        if wandb_run is not None:
-            import wandb  # type: ignore
-            gs = int(c.step)
-            wandb.log({
-                f"eval/pass@{args.pass_k}/accuracy": er.acc,
-                f"eval/pass@{args.pass_k}/n_samples": er.n,
-                "eval/global_step": gs,
-                "global_step": gs,
-                "eval/label": er.label,
-                "eval/model": er.model,
-            }, step=gs)
-
     # Print compact summary
     print("\n=== Summary (accuracy) ===")
 
@@ -1311,33 +1301,33 @@ def main() -> None:
         print(f"{step_str:>6}  acc={r.acc:.6f}  n={r.n}  model={r.model}")
 
 
-    # Finalize W&B logging (table + finish) if requested.
+    # Finalize W&B - log the final chart with all results
     if wandb_run is not None:
         try:
             import wandb  # type: ignore
 
-            def _key(x: EvalResult):
-                return (-1 if x.step is None else x.step)
-
+            # Create final pass@k curve with all results
+            sorted_results = sorted(results, key=lambda r: r.step if r.step is not None else -1)
             table_data = []
-            for r in sorted(results, key=_key):
-                step_str = "step0" if r.step is None else f"step_{r.step}"
-                table_data.append([step_str, r.acc, r.n, r.model])
+            for r in sorted_results:
+                checkpoint_step = 0 if r.step is None else int(r.step)
+                table_data.append([checkpoint_step, r.acc, r.n])
 
             table = wandb.Table(
-                columns=["checkpoint", f"pass@{args.pass_k}_acc", "n_samples", "model_path"],
                 data=table_data,
+                columns=["checkpoint_step", "accuracy", "n_samples"]
             )
-            wandb.log({f"pass@{args.pass_k}_results": table})
-        except Exception as e:
-            print(f"\nWarning: W&B final table logging failed: {e}")
-        finally:
-            try:
-                import wandb  # type: ignore
-                wandb.finish()
-            except Exception:
-                pass
-            print(f"\nLogged results to W&B project: {args.wandb_project}")
+            wandb.log({
+                f"eval/pass@{args.pass_k}_curve": wandb.plot.line(
+                    table, "checkpoint_step", "accuracy",
+                    title=f"Pass@{args.pass_k} Accuracy vs Checkpoint"
+                )
+            })
+
+            wandb.finish()
+        except Exception:
+            pass
+        print(f"\nLogged results to W&B project: {args.wandb_project}")
     # Final flush (we also flush after each checkpoint).
     _flush_progress(args, results)
 
