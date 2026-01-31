@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate step0 HF model + all `global_step_*` checkpoints with vLLM."""
+"""Evaluate step0 HF model + all `global_step_*` checkpoints with vLLM or SGLang."""
 
 from __future__ import annotations
 
@@ -210,7 +210,7 @@ def run_verl_merge_fsdp_to_hf(
 
 
 # ---------------------------
-# vLLM inference + scoring
+# Inference engine + scoring (vLLM serve / SGLang serve)
 # ---------------------------
 
 
@@ -239,121 +239,9 @@ def get_score_fn():
     return _score
 
 
-def build_vllm_llm(model_dir_or_name: str, tokenizer_dir_or_name: str):
-    """Instantiate vLLM engine.
-
-    We always pass `tokenizer=step0_model` to keep tokenization consistent across checkpoints
-    and to avoid warnings caused by saved tokenizer.json in merged dirs.
-    """
-    # Avoid HF tokenizers fork warning spam.
-    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-
-    from vllm import LLM
-
-    gpu_mem_util = float(os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "0.80"))
-    tp = _infer_tensor_parallel_size()
-
-    kwargs = dict(
-        model=str(model_dir_or_name),
-        tokenizer=str(tokenizer_dir_or_name),
-        dtype="auto",
-        tensor_parallel_size=tp,
-        gpu_memory_utilization=gpu_mem_util,
-        disable_log_stats=True,
-        trust_remote_code=False,
-    )
-
-    return LLM(**kwargs)
-
-
-def vllm_generate_solutions(
-    llm,
-    records: List[Dict[str, Any]],
-    batch_size: int,
-    temperature: float,
-    top_p: float,
-    max_tokens: Optional[int],
-    seed: int,
-    pass_k: int = 1,
-) -> List[List[str]]:
-    """Generate pass_k solutions per record.
-    
-    Returns: List[List[str]] where outer list is per record, inner list is k solutions.
-    """
-    from vllm import SamplingParams
-
-    sp = SamplingParams(
-        temperature=temperature,
-        top_p=top_p,
-        max_tokens=max_tokens,
-        seed=seed,
-        n=pass_k,  # Generate k solutions per prompt
-    )
-
-    all_solutions: List[List[str]] = []
-    n_batches = (len(records) + batch_size - 1) // batch_size
-
-    for i in tqdm(
-        range(0, len(records), batch_size),
-        desc="vllm inference",
-        total=n_batches,
-        file=sys.stderr,
-    ):
-        batch = records[i : i + batch_size]
-        messages_list = [r["prompt"] for r in batch]
-        outs = llm.chat(messages_list, sampling_params=sp)
-        # Each output has k solutions in outputs[0:k]
-        for o in outs:
-            solutions = [output.text for output in o.outputs]
-            all_solutions.append(solutions)
-
-    return all_solutions
-
-
-def eval_records_with_vllm(
-    model_dir_or_name: str,
-    tokenizer_dir_or_name: str,
-    records: List[Dict[str, Any]],
-    batch_size: int,
-    temperature: float,
-    top_p: float,
-    max_tokens: Optional[int],
-    seed: int,
-    pass_k: int = 1,
-) -> Tuple[float, List[bool]]:
-    llm = build_vllm_llm(model_dir_or_name, tokenizer_dir_or_name)
-
-    solutions = vllm_generate_solutions(
-        llm=llm,
-        records=records,
-        batch_size=batch_size,
-        temperature=temperature,
-        top_p=top_p,
-        max_tokens=max_tokens,
-        seed=seed,
-        pass_k=pass_k,
-    )
-
-    score_fn = get_score_fn()
-
-    oks: List[bool] = []
-    for r, sol_list in tqdm(
-        zip(records, solutions),
-        total=len(records),
-        desc="compute_score",
-        file=sys.stderr,
-    ):
-        gt = r["reward_model"]["ground_truth"]
-        # pass@k: check if ANY of the k solutions is correct
-        any_correct = any(bool(score_fn(sol, gt)) for sol in sol_list)
-        oks.append(any_correct)
-
-    acc = float(sum(oks) / max(1, len(oks)))
-    return acc, oks
-
-
 # ---------------------------
-# vLLM Serve (OpenAI API) helpers
+# Serve Mode (OpenAI API compatible) helpers
+# Both vLLM and SGLang provide OpenAI-compatible API servers
 # ---------------------------
 
 
@@ -371,13 +259,13 @@ def _pick_free_port() -> int:
         return int(s.getsockname()[1])
 
 
-def _wait_vllm_ready(base_url: str, timeout_s: int) -> str:
-    """Wait until vLLM OpenAI server is ready.
+def _wait_server_ready(base_url: str, timeout_s: int, backend: str = "vllm") -> str:
+    """Wait until OpenAI-compatible server is ready (vLLM or SGLang).
 
     Returns the first model id from /v1/models.
     """
     if requests is None:
-        raise RuntimeError("requests is required for --use-vllm-serve, but it's not installed.")
+        raise RuntimeError(f"requests is required for {backend} serve, but it's not installed.")
 
     t0 = time.time()
     last_err: str | None = None
@@ -397,7 +285,7 @@ def _wait_vllm_ready(base_url: str, timeout_s: int) -> str:
             last_err = repr(e)
         time.sleep(0.5)
 
-    raise RuntimeError(f"vLLM server not ready after {timeout_s}s. last_err={last_err}")
+    raise RuntimeError(f"{backend} server not ready after {timeout_s}s. last_err={last_err}")
 
 
 def _start_vllm_serve(
@@ -438,6 +326,52 @@ def _start_vllm_serve(
     ]
     if max_model_len is not None:
         cmd += ["--max-model-len", str(max_model_len)]
+
+    # Make logs unbuffered; keep stdout/stderr for debugging.
+    env = dict(os.environ)
+    env.setdefault("PYTHONUNBUFFERED", "1")
+
+    return subprocess.Popen(
+        cmd,
+        stdout=sys.stderr,
+        stderr=sys.stderr,
+        text=True,
+        env=env,
+        start_new_session=True,
+        bufsize=1,
+    )
+
+
+def _start_sglang_serve(
+    *,
+    model: str,
+    tokenizer: str,
+    host: str,
+    port: int,
+    tp_size: int,
+    mem_fraction: float,
+) -> subprocess.Popen:
+    """Start SGLang OpenAI API server as a subprocess.
+
+    Uses a dedicated process group so we can reliably terminate all workers.
+    """
+    cmd = [
+        sys.executable,
+        "-m",
+        "sglang.launch_server",
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--model-path",
+        str(model),
+        "--tokenizer-path",
+        str(tokenizer),
+        "--tp-size",
+        str(tp_size),
+        "--mem-fraction-static",
+        str(mem_fraction),
+    ]
 
     # Make logs unbuffered; keep stdout/stderr for debugging.
     env = dict(os.environ)
@@ -614,8 +548,9 @@ async def _openai_chat_completion_async(
     return [""] * n
 
 
-def eval_records_with_vllm_serve(
+def eval_records_with_serve(
     *,
+    backend: str,  # "vllm" or "sglang"
     model_dir_or_name: str,
     tokenizer_dir_or_name: str,
     records: List[Dict[str, Any]],
@@ -629,22 +564,23 @@ def eval_records_with_vllm_serve(
     start_timeout_s: int,
     stop_timeout_s: int,
     tp_size: int,
-    dp_size: int,
+    dp_size: int,  # Only for vLLM
     gpu_mem_util: float,
-    max_model_len: Optional[int],
+    max_model_len: Optional[int],  # Only for vLLM
     pass_k: int = 1,
     max_concurrent_requests: int = 64,
 ) -> Tuple[float, List[bool]]:
-    """Evaluate records using vLLM serve with async concurrent requests.
+    """Evaluate records using vLLM or SGLang serve with async concurrent requests.
     
     Args:
-        max_concurrent_requests: Maximum number of concurrent requests to vLLM server.
+        backend: "vllm" or "sglang"
+        max_concurrent_requests: Maximum number of concurrent requests to server.
             This controls how many requests are in-flight at once. Higher values = more
             throughput but more memory usage. Default 64 works well for DP=4.
     """
     if aiohttp is None or asyncio is None:
         raise RuntimeError(
-            "aiohttp and asyncio are required for async vLLM serve eval. "
+            f"aiohttp and asyncio are required for async {backend} serve eval. "
             "Install with: pip install aiohttp"
         )
     
@@ -653,16 +589,29 @@ def eval_records_with_vllm_serve(
 
     base_url = f"http://{host}:{port}"
 
-    proc = _start_vllm_serve(
-        model=model_dir_or_name,
-        tokenizer=tokenizer_dir_or_name,
-        host=host,
-        port=port,
-        tp_size=tp_size,
-        dp_size=dp_size,
-        gpu_mem_util=gpu_mem_util,
-        max_model_len=max_model_len,
-    )
+    # Start the appropriate server
+    if backend == "vllm":
+        proc = _start_vllm_serve(
+            model=model_dir_or_name,
+            tokenizer=tokenizer_dir_or_name,
+            host=host,
+            port=port,
+            tp_size=tp_size,
+            dp_size=dp_size,
+            gpu_mem_util=gpu_mem_util,
+            max_model_len=max_model_len,
+        )
+    elif backend == "sglang":
+        proc = _start_sglang_serve(
+            model=model_dir_or_name,
+            tokenizer=tokenizer_dir_or_name,
+            host=host,
+            port=port,
+            tp_size=tp_size,
+            mem_fraction=gpu_mem_util,
+        )
+    else:
+        raise ValueError(f"Unknown backend: {backend}")
 
     try:
         # If server exits early, surface logs.
@@ -670,7 +619,7 @@ def eval_records_with_vllm_serve(
         while proc.poll() is None and time.time() - t0 < start_timeout_s:
             # Try ready probe; if it raises, keep looping.
             try:
-                model_id = _wait_vllm_ready(base_url, timeout_s=2)
+                model_id = _wait_server_ready(base_url, timeout_s=2, backend=backend)
                 break
             except Exception:
                 time.sleep(0.5)
@@ -678,14 +627,14 @@ def eval_records_with_vllm_serve(
             # Either exited or timed out.
             out, err = _stop_process_tree(proc, timeout_s=stop_timeout_s)
             raise RuntimeError(
-                "vLLM serve failed to become ready.\n"
+                f"{backend} serve failed to become ready.\n"
                 f"model={model_dir_or_name}\n"
                 f"base_url={base_url}\n\n"
                 f"STDOUT:\n{out}\n\nSTDERR:\n{err}"
             )
 
         # If we broke out via model_id, ensure it's defined.
-        model_id = _wait_vllm_ready(base_url, timeout_s=start_timeout_s)
+        model_id = _wait_server_ready(base_url, timeout_s=start_timeout_s, backend=backend)
 
         # Run async inference with periodic server health checks
         try:
@@ -700,13 +649,14 @@ def eval_records_with_vllm_serve(
                 pass_k=pass_k,
                 max_concurrent_requests=max_concurrent_requests,
                 proc=proc,  # Pass process for health monitoring
+                backend=backend,
             ))
         except Exception as e:
             # Check if server crashed
             if proc.poll() is not None:
                 out, err = _stop_process_tree(proc, timeout_s=stop_timeout_s)
                 raise RuntimeError(
-                    f"vLLM server crashed during inference: {e}\n"
+                    f"{backend} server crashed during inference: {e}\n"
                     f"STDOUT:\n{out}\n\nSTDERR:\n{err}"
                 )
             else:
@@ -730,6 +680,7 @@ async def _eval_records_async(
     pass_k: int,
     max_concurrent_requests: int,
     proc: Optional[subprocess.Popen] = None,
+    backend: str = "vllm",
 ) -> List[bool]:
     """Async concurrent evaluation of records.
     
@@ -764,18 +715,18 @@ async def _eval_records_async(
         tasks = [process_one_record(session, r) for r in records]
         
         # Run all tasks concurrently with simple progress tracking
-        print(f"Starting {len(tasks)} async inference tasks with max_concurrent={max_concurrent_requests}...", file=sys.stderr)
+        print(f"Starting {len(tasks)} async inference tasks with max_concurrent={max_concurrent_requests} on {backend}...", file=sys.stderr)
         
         # Use tqdm.asyncio.tqdm.gather for proper async progress bar
         try:
             from tqdm.asyncio import tqdm as async_tqdm
-            results = await async_tqdm.gather(*tasks, desc="async inference")
+            results = await async_tqdm.gather(*tasks, desc=f"{backend} async inference")
         except ImportError:
             # Fallback: use manual progress tracking
             results = []
             completed = 0
             pending = set(tasks)
-            pbar = tqdm(total=len(tasks), desc="async inference", file=sys.stderr)
+            pbar = tqdm(total=len(tasks), desc=f"{backend} async inference", file=sys.stderr)
             
             while pending:
                 done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
@@ -802,42 +753,35 @@ def _run_child_mode(args: argparse.Namespace) -> None:
     idx = sample_indices(len(records), args.num_samples, args.seed)
     records = [records[i] for i in idx]
 
-    if args.use_vllm_serve:
-        dp = int(args.vllm_dp_size)
-        if dp <= 0:
-            dp = _infer_visible_gpu_count()
-        acc, _ = eval_records_with_vllm_serve(
-            model_dir_or_name=args._child_model,
-            tokenizer_dir_or_name=args.step0_model,
-            records=records,
-            batch_size=args.batch_size,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            max_tokens=args.max_tokens,
-            seed=args.seed,
-            host=args.vllm_host,
-            port=int(args.vllm_port),
-            start_timeout_s=int(args.vllm_start_timeout_s),
-            stop_timeout_s=int(args.vllm_stop_timeout_s),
-            tp_size=int(args.vllm_tp_size),
-            dp_size=dp,
-            gpu_mem_util=float(args.vllm_gpu_memory_utilization),
-            max_model_len=args.vllm_max_model_len,
-            pass_k=args.pass_k,
-            max_concurrent_requests=args.max_concurrent_requests,
-        )
-    else:
-        acc, _ = eval_records_with_vllm(
-            model_dir_or_name=args._child_model,
-            tokenizer_dir_or_name=args.step0_model,
-            records=records,
-            batch_size=args.batch_size,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            max_tokens=args.max_tokens,
-            seed=args.seed,
-            pass_k=args.pass_k,
-        )
+    # Determine which backend to use
+    backend = getattr(args, 'backend', 'vllm').lower()
+    
+    # All backends now use serve mode
+    dp = int(args.serve_dp_size) if backend == "vllm" else 1
+    if dp <= 0:
+        dp = _infer_visible_gpu_count()
+    
+    acc, _ = eval_records_with_serve(
+        backend=backend,
+        model_dir_or_name=args._child_model,
+        tokenizer_dir_or_name=args.step0_model,
+        records=records,
+        batch_size=args.batch_size,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        max_tokens=args.max_tokens,
+        seed=args.seed,
+        host=args.serve_host,
+        port=int(args.serve_port),
+        start_timeout_s=int(args.serve_start_timeout_s),
+        stop_timeout_s=int(args.serve_stop_timeout_s),
+        tp_size=int(args.serve_tp_size),
+        dp_size=dp,
+        gpu_mem_util=float(args.serve_gpu_memory_utilization),
+        max_model_len=args.serve_max_model_len,
+        pass_k=args.pass_k,
+        max_concurrent_requests=args.max_concurrent_requests,
+    )
 
     out = {
         "label": args._child_label,
@@ -1002,7 +946,16 @@ def main() -> None:
     )
     p.add_argument("--seed", type=int, default=1)
 
-    # vLLM sampling
+    # Backend selection
+    p.add_argument(
+        "--backend",
+        type=str,
+        choices=["vllm", "sglang"],
+        default="vllm",
+        help="Inference backend to use: 'vllm' (default) or 'sglang'.",
+    )
+
+    # Sampling parameters
     p.add_argument("--temperature", type=float, default=0.6)
     p.add_argument("--top-p", type=float, default=0.95)
     p.add_argument("--max-tokens", type=int, default=None)
@@ -1014,68 +967,56 @@ def main() -> None:
         help="Generate k solutions per problem for pass@k evaluation.",
     )
 
-    # vLLM serve (OpenAI API) controls
+    # Serve mode controls (applies to both vLLM and SGLang)
+    p.add_argument("--serve-host", type=str, default="127.0.0.1")
     p.add_argument(
-        "--use-vllm-serve",
-        action="store_true",
-        default=True,
-        help="Evaluate via `vllm serve` (OpenAI API). Default: enabled.",
-    )
-    p.add_argument(
-        "--no-vllm-serve",
-        dest="use_vllm_serve",
-        action="store_false",
-        help="Disable `vllm serve` and use in-process vLLM Python API.",
-    )
-    p.add_argument("--vllm-host", type=str, default="127.0.0.1")
-    p.add_argument(
-        "--vllm-port",
+        "--serve-port",
         type=int,
         default=0,
-        help="Port for vLLM serve. 0 means auto-pick a free port.",
+        help="Port for serve mode. 0 means auto-pick a free port.",
     )
     p.add_argument(
-        "--vllm-start-timeout-s",
+        "--serve-start-timeout-s",
         type=int,
         default=300,
-        help="Seconds to wait for vLLM serve to become ready.",
+        help="Seconds to wait for server to become ready.",
     )
     p.add_argument(
-        "--vllm-stop-timeout-s",
+        "--serve-stop-timeout-s",
         type=int,
         default=15,
-        help="Seconds to wait for vLLM serve to stop before SIGKILL.",
+        help="Seconds to wait for server to stop before SIGKILL.",
     )
     p.add_argument(
-        "--vllm-tp-size",
+        "--serve-tp-size",
         type=int,
         default=1,
-        help="Tensor parallel size for vLLM serve. Recommended: 1.",
+        help="Tensor parallel size. Recommended: 1.",
     )
     p.add_argument(
-        "--vllm-dp-size",
+        "--serve-dp-size",
         type=int,
         default=0,
-        help="Data parallel size for vLLM serve. 0 means auto=number of visible GPUs.",
+        help="Data parallel size (vLLM only). 0 means auto=number of visible GPUs.",
     )
     p.add_argument(
-        "--vllm-gpu-memory-utilization",
+        "--serve-gpu-memory-utilization",
         type=float,
-        default=float(os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "0.75")),
-        help="GPU memory utilization for vLLM serve.",
+        default=float(os.environ.get("SERVE_GPU_MEMORY_UTILIZATION", "0.75")),
+        help="GPU memory utilization for server.",
     )
 
     p.add_argument(
-        "--vllm-max-model-len",
+        "--serve-max-model-len",
         type=_int_or_none,
         default=None,
-        help="Max model length for vLLM. Use 'None' to let vLLM decide.",
+        help="Max model length (vLLM only). Use 'None' to let vLLM decide.",
     )
     p.add_argument(
         "--max-concurrent-requests",
         type=int,
         default=64,
-        help="Max concurrent requests to vLLM serve (for async mode). Higher = more throughput but more memory.",
+        help="Max concurrent requests to server (for async mode). Higher = more throughput but more memory.",
     )
     # outputs
     p.add_argument(
@@ -1151,6 +1092,8 @@ def main() -> None:
         str(args.num_samples),
         "--seed",
         str(args.seed),
+        "--backend",
+        args.backend,
         "--temperature",
         str(args.temperature),
         "--top-p",
@@ -1160,32 +1103,28 @@ def main() -> None:
         "--pass-k",
         str(args.pass_k),
 
-        # vLLM serve settings (passed through to child)
-        "--vllm-host",
-        args.vllm_host,
-        "--vllm-port",
-        str(args.vllm_port),
-        "--vllm-start-timeout-s",
-        str(args.vllm_start_timeout_s),
-        "--vllm-stop-timeout-s",
-        str(args.vllm_stop_timeout_s),
-        "--vllm-tp-size",
-        str(args.vllm_tp_size),
-        "--vllm-dp-size",
-        str(args.vllm_dp_size),
-        "--vllm-gpu-memory-utilization",
-        str(args.vllm_gpu_memory_utilization),
-        "--vllm-max-model-len",
-        str(args.vllm_max_model_len),
+        # Serve settings (passed through to child)
+        "--serve-host",
+        args.serve_host,
+        "--serve-port",
+        str(args.serve_port),
+        "--serve-start-timeout-s",
+        str(args.serve_start_timeout_s),
+        "--serve-stop-timeout-s",
+        str(args.serve_stop_timeout_s),
+        "--serve-tp-size",
+        str(args.serve_tp_size),
+        "--serve-dp-size",
+        str(args.serve_dp_size),
+        "--serve-gpu-memory-utilization",
+        str(args.serve_gpu_memory_utilization),
+        "--serve-max-model-len",
+        str(args.serve_max_model_len),
         "--max-concurrent-requests",
         str(args.max_concurrent_requests),
     ]
     if args.max_tokens is not None:
         base_args.extend(["--max-tokens", str(args.max_tokens)])
-
-    # Pass serve toggle to child.
-    if not args.use_vllm_serve:
-        base_args.append("--no-vllm-serve")
 
     script_path = Path(__file__).resolve()
 
