@@ -538,8 +538,6 @@ class DataParallelPPOActor(BasePPOActor):
 
                     # ========== Teacher KL Loss (GKD) ==========
                     if use_teacher_kl_loss:
-                        from verl.trainer.ppo.core_algos import compute_teacher_kl_loss
-
                         teacher_topk_logps = model_inputs["teacher_topk_logps"]
                         teacher_topk_indices = model_inputs["teacher_topk_indices"]
 
@@ -550,13 +548,31 @@ class DataParallelPPOActor(BasePPOActor):
                                 "Please set use_remove_padding=False in model config for GKD."
                             )
 
-                        teacher_kl = compute_teacher_kl_loss(
-                            student_logits=logits,
-                            teacher_topk_logps=teacher_topk_logps,
-                            teacher_topk_indices=teacher_topk_indices,
-                            response_mask=response_mask,
-                            temperature=getattr(self.config, "teacher_kl_temperature", 1.0),
-                        )
+                        # Use chunked computation for memory efficiency on long sequences
+                        use_chunked_kl = getattr(self.config, "use_chunked_teacher_kl", False)
+                        teacher_kl_chunk_size = getattr(self.config, "teacher_kl_chunk_size", 1024)
+
+                        if use_chunked_kl:
+                            from verl.trainer.ppo.core_algos import compute_teacher_kl_loss_chunked
+
+                            teacher_kl = compute_teacher_kl_loss_chunked(
+                                student_logits=logits,
+                                teacher_topk_logps=teacher_topk_logps,
+                                teacher_topk_indices=teacher_topk_indices,
+                                response_mask=response_mask,
+                                temperature=getattr(self.config, "teacher_kl_temperature", 1.0),
+                                chunk_size=teacher_kl_chunk_size,
+                            )
+                        else:
+                            from verl.trainer.ppo.core_algos import compute_teacher_kl_loss
+
+                            teacher_kl = compute_teacher_kl_loss(
+                                student_logits=logits,
+                                teacher_topk_logps=teacher_topk_logps,
+                                teacher_topk_indices=teacher_topk_indices,
+                                response_mask=response_mask,
+                                temperature=getattr(self.config, "teacher_kl_temperature", 1.0),
+                            )
 
                         # Apply GKD selection mask if present (for GRPO + GKD mode)
                         # This allows selective teacher KL on best/worst/random responses

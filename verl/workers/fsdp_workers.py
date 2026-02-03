@@ -722,6 +722,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         log_gpu_memory_usage("After update_weights", logger=logger)
         del params, per_tensor_param
         aggressive_empty_cache(force_sync=True)
+
+        # Offload actor model to CPU after weight sync to free GPU memory for vLLM KV cache
+        # This is critical for long sequences where KV cache can consume significant memory
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            log_gpu_memory_usage("After offload actor model in rollout_mode", logger=logger)
+            aggressive_empty_cache(force_sync=True)
+
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["kv_cache"])
         log_gpu_memory_usage("After resume kv_cache", logger=logger)

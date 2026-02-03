@@ -1844,3 +1844,100 @@ def compute_teacher_kl_loss_from_logprobs(
     per_token_kl = per_token_kl * response_mask.float()
 
     return per_token_kl
+
+
+def compute_teacher_kl_loss_chunked(
+    student_logits: torch.Tensor,
+    teacher_topk_logps: torch.Tensor,
+    teacher_topk_indices: torch.Tensor,
+    response_mask: torch.Tensor,
+    temperature: float = 1.0,
+    chunk_size: int = 1024,
+) -> torch.Tensor:
+    """
+    Memory-efficient chunked KL divergence loss between student and teacher distributions.
+
+    This function processes the sequence in chunks to reduce peak memory usage.
+    Instead of computing log_softmax over the full [batch, seq_len, vocab_size] tensor,
+    it processes chunk_size tokens at a time, significantly reducing memory footprint.
+
+    For a model with vocab_size=150k and seq_len=12k:
+    - Non-chunked: peak memory ~ batch * 12k * 150k * 4 bytes = ~7GB per sample
+    - Chunked (1k): peak memory ~ batch * 1k * 150k * 4 bytes = ~600MB per sample
+
+    Args:
+        student_logits: Student model logits, shape [batch, seq_len, vocab_size]
+        teacher_topk_logps: Teacher's top-k log probabilities, shape [batch, seq_len, top_k]
+        teacher_topk_indices: Indices of teacher's top-k tokens, shape [batch, seq_len, top_k]
+        response_mask: Mask for response tokens, shape [batch, seq_len]
+        temperature: Temperature for softmax, default 1.0
+        chunk_size: Number of sequence positions to process at once, default 1024
+
+    Returns:
+        per_token_kl_loss: KL loss for each token position, shape [batch, seq_len]
+
+    Note:
+        The chunk_size parameter controls the memory/compute trade-off:
+        - Smaller chunk_size = less memory but more kernel launches
+        - Larger chunk_size = more memory but fewer kernel launches
+        For long sequences (>4k tokens), chunk_size=1024 is recommended.
+    """
+    import torch.nn.functional as F
+
+    batch_size, seq_len, vocab_size = student_logits.shape
+    device = student_logits.device
+    dtype = student_logits.dtype
+
+    # Pre-allocate output tensor
+    per_token_kl = torch.zeros(batch_size, seq_len, device=device, dtype=dtype)
+
+    # Apply temperature scaling if needed
+    if temperature != 1.0:
+        temp_factor = 1.0 / temperature
+    else:
+        temp_factor = None
+
+    # Process in chunks along sequence dimension
+    for start_idx in range(0, seq_len, chunk_size):
+        end_idx = min(start_idx + chunk_size, seq_len)
+
+        # Get chunk of student logits
+        student_chunk = student_logits[:, start_idx:end_idx, :]  # [batch, chunk, vocab]
+
+        # Apply temperature if needed
+        if temp_factor is not None:
+            student_chunk = student_chunk * temp_factor
+
+        # Compute log softmax for this chunk only (memory efficient)
+        student_log_probs_chunk = F.log_softmax(student_chunk, dim=-1)  # [batch, chunk, vocab]
+
+        # Get corresponding teacher data
+        teacher_indices_chunk = teacher_topk_indices[:, start_idx:end_idx, :]  # [batch, chunk, topk]
+        teacher_logps_chunk = teacher_topk_logps[:, start_idx:end_idx, :]  # [batch, chunk, topk]
+        mask_chunk = response_mask[:, start_idx:end_idx]  # [batch, chunk]
+
+        # Gather student log probs at teacher's top-k indices
+        student_topk_log_probs = torch.gather(
+            student_log_probs_chunk, dim=-1, index=teacher_indices_chunk
+        )  # [batch, chunk, topk]
+
+        # Compute teacher probabilities from log probs
+        teacher_topk_probs = torch.exp(teacher_logps_chunk)  # [batch, chunk, topk]
+
+        # KL(P||Q) = sum_i P(i) * (log P(i) - log Q(i))
+        chunk_kl = torch.sum(
+            teacher_topk_probs * (teacher_logps_chunk - student_topk_log_probs),
+            dim=-1,
+        )  # [batch, chunk]
+
+        # Apply mask
+        chunk_kl = chunk_kl * mask_chunk.float()
+
+        # Store result
+        per_token_kl[:, start_idx:end_idx] = chunk_kl
+
+        # Explicitly delete intermediate tensors to free memory
+        del student_chunk, student_log_probs_chunk, student_topk_log_probs
+        del teacher_topk_probs, chunk_kl
+
+    return per_token_kl
