@@ -14,16 +14,17 @@ rm -rf wandb
 
 ray stop -f || true
 
-LOG="run_gkd_only_fsdp2_qwen2p5_14b_to_0p5b_$(date +%Y%m%d_%H%M%S).log"
+LOG="run_gkd_only_fsdp2_qwen3_8b_to_0p6b_$(date +%Y%m%d_%H%M%S).log"
 PIDFILE="run.pid"
 
 # ====== Sequence length knobs ======
 max_prompt_length=512
-max_response_length=512
+max_response_length=12288
 max_total_length=$((max_prompt_length + max_response_length))
 
 # vLLM settings
 vllm_max_batched_tokens=$((max_total_length))
+# vllm_max_batched_tokens=8192
 train_max_token_len_per_gpu=$((max_total_length))
 
 # ====== Teacher server settings ======
@@ -45,23 +46,25 @@ args=(
   +actor_rollout_ref.teacher.server_port=${teacher_port}
   +actor_rollout_ref.teacher.n_server_workers=${teacher_workers}
   +actor_rollout_ref.teacher.temperature=1.0
+  +actor_rollout_ref.teacher.only_response=True
 
   # ====== Data ======
-  data.train_files=/workspace/mlf2/verl/reproduce/data/gsm8k/local_parquet_dir/train.parquet
-  data.val_files=/workspace/mlf2/verl/reproduce/data/gsm8k/local_parquet_dir/test.parquet
+  data.train_files=/workspace/mlf2/verl/reproduce/data/openthoughts3/local_parquet_dir/train.parquet
+  data.val_files=/workspace/mlf2/verl/reproduce/data/openthoughts3/local_parquet_dir/validation.parquet
   data.train_batch_size=6
   data.max_prompt_length=${max_prompt_length}
   data.max_response_length=${max_response_length}
   data.filter_overlong_prompts=True
   data.truncation=left
   data.train_max_samples=4800
-  data.val_max_samples=200
+  data.val_max_samples=400
   data.val_batch_size=12
 
   # ====== Model ======
-  actor_rollout_ref.model.path=Qwen/Qwen2.5-0.5B-Instruct
+  actor_rollout_ref.model.path=Qwen/Qwen3-0.6B
   actor_rollout_ref.model.use_remove_padding=False  # GKD needs logits, disable remove_padding
   ++actor_rollout_ref.model.enable_gradient_checkpointing=true
+  ++actor_rollout_ref.actor.fsdp_config.model_dtype=bf16
 
   # ====== FSDP2 Backend ======
   actor_rollout_ref.actor.strategy=fsdp2
@@ -70,12 +73,16 @@ args=(
   actor_rollout_ref.actor.fsdp_config.param_offload=True
   actor_rollout_ref.actor.fsdp_config.optimizer_offload=True
 
+  # Memory Optimization
+  +actor_rollout_ref.actor.use_chunked_teacher_kl=True
+  +actor_rollout_ref.actor.teacher_kl_chunk_size=1024
+
   # Dynamic batch size for variable sequence lengths
   actor_rollout_ref.actor.use_dynamic_bsz=True
   actor_rollout_ref.actor.ulysses_sequence_parallel_size=1
 
   # PPO batch sizes (still used for actor update in GKD)
-  actor_rollout_ref.actor.ppo_mini_batch_size=8
+  actor_rollout_ref.actor.ppo_mini_batch_size=4
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1
   actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${train_max_token_len_per_gpu}
 
@@ -94,17 +101,17 @@ args=(
   actor_rollout_ref.rollout.n=1  # GKD only: single response per prompt
   actor_rollout_ref.rollout.temperature=0.6
   actor_rollout_ref.rollout.top_p=0.95
-  # ++actor_rollout_ref.rollout.stop_token_ids='[151645,151643]' # this is for qwen3, turn it off for qwen2
-  critic.model.path=Qwen/Qwen2.5-0.5B-Instruct
+  ++actor_rollout_ref.rollout.stop_token_ids='[151645,151643]' # this is for qwen3, turn it off for qwen2
+  critic.model.path=Qwen/Qwen3-0.6B
 
   # ====== Trainer ======
   trainer.critic_warmup=0
   trainer.logger='["console","wandb"]'
   trainer.project_name=mw_verl_recipe_reasoning
-  trainer.experiment_name=gkd_only_qwen2p5_14b_to_0p5b_gsm8k_fsdp2
+  trainer.experiment_name=gkd_only_qwen3_8b_to_0p6b_lambda1p0_gsm8k_fsdp2
   trainer.n_gpus_per_node=3
   trainer.nnodes=1
-  trainer.save_freq=200
+  trainer.save_freq=400
   trainer.test_freq=200
   trainer.total_epochs=1
   trainer.val_before_train=False

@@ -239,7 +239,8 @@ class FSDPActorConfig(ActorConfig):
     gkd_only_mode: bool = False
     teacher_kl_coef: float = 1.0
     teacher_kl_temperature: float = 1.0
-
+    use_chunked_teacher_kl: bool = False
+    teacher_kl_chunk_size: int = 1024
     gkd_select_strategy: str = "all" # all, random, best, worst
     gkd_select_k: int = 1
 

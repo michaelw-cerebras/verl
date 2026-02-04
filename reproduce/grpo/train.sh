@@ -41,7 +41,7 @@ args=(
   data.filter_overlong_prompts=True
   data.truncation=left
   data.train_max_samples=4800
-  data.val_max_samples=200
+  data.val_max_samples=500
   data.val_batch_size=16
 
   # Model
@@ -64,10 +64,12 @@ args=(
   actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True
   actor_rollout_ref.actor.ulysses_sequence_parallel_size=2
   actor_rollout_ref.ref.ulysses_sequence_parallel_size=2
+  actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=8192
+  actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=8192
 
   # PPO sizes — let dynamic bsz handle tokens; keep micro small to avoid spikes
   actor_rollout_ref.actor.ppo_mini_batch_size=6
-  actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1
+  actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=null
   actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${train_max_token_len_per_gpu}
 
   # Optim
@@ -88,32 +90,32 @@ args=(
   actor_rollout_ref.rollout.max_num_batched_tokens=${vllm_max_batched_tokens}
   actor_rollout_ref.rollout.tensor_model_parallel_size=2
   actor_rollout_ref.rollout.gpu_memory_utilization=0.75
-  actor_rollout_ref.rollout.n=4 # This is important!
-  actor_rollout_ref.rollout.temperature=1.0
+  actor_rollout_ref.rollout.n=8 # This is important!
+  actor_rollout_ref.rollout.temperature=0.6
   actor_rollout_ref.rollout.top_p=1.0
   ++actor_rollout_ref.rollout.stop_token_ids='[151645,151643]'
 
   # Logprob micro — keep tiny for long seq
-  actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1
-  actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1
+  actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=null
+  actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=null
 
   # Reward manager & overlong buffer
-  reward_model.reward_manager=dapo
-  +reward_model.reward_kwargs.max_resp_len=${max_response_length}
-  +reward_model.reward_kwargs.overlong_buffer_cfg.enable=True
-  +reward_model.reward_kwargs.overlong_buffer_cfg.len=$((max_response_length/4))
-  +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=0.3
-  +reward_model.reward_kwargs.overlong_buffer_cfg.log=True
+  # reward_model.reward_manager=dapo
+  # +reward_model.reward_kwargs.max_resp_len=${max_response_length}
+  # +reward_model.reward_kwargs.overlong_buffer_cfg.enable=True
+  # +reward_model.reward_kwargs.overlong_buffer_cfg.len=$((max_response_length/4))
+  # +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=0.3
+  # +reward_model.reward_kwargs.overlong_buffer_cfg.log=True
 
   # Trainer
   trainer.critic_warmup=0
   trainer.logger='["console","wandb"]'
   trainer.project_name=mw_verl_recipe_reasoning
-  trainer.experiment_name=openthoughts-grpo-qwen3_0p6b_fsdp2
+  trainer.experiment_name=openthoughts-grpo-qwen3_0p6b_fsdp2_n8_no_length_penalty
   trainer.n_gpus_per_node=4
   trainer.nnodes=1
   trainer.save_freq=100
-  trainer.test_freq=100
+  trainer.test_freq=50
   trainer.total_epochs=1
   trainer.val_before_train=True
 )

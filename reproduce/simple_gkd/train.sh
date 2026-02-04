@@ -36,9 +36,9 @@ args=(
   trainer.test_freq=5
   trainer.logger='["console","wandb"]'
   trainer.project_name=mw_verl_reproduce
-  trainer.experiment_name=gsm8k-gkd-qwen2p5_14b_to_0p5b_lambda0p7
+  trainer.experiment_name=gsm8k-gkd-qwen2p5_14b_to_0p5b_lambda0p9
   trainer.total_training_steps=null # null
-  trainer.gkd_lambda=0.7 # 0.0 for pure off policy and 1.0 for pure on policy
+  trainer.gkd_lambda=0.9 # 0.0 for pure off policy and 1.0 for pure on policy
   trainer.enable_off_policy=True
 
 
@@ -64,7 +64,7 @@ PIDFILE="run.pid"
 nohup \
 env \
 HYDRA_FULL_ERROR=1 \
-CUDA_VISIBLE_DEVICES=1,2,5 \
+CUDA_VISIBLE_DEVICES=4,5,6 \
   python3 -u -m recipe.gkd.main_gkd "${args[@]}" \
   > "$LOG" 2>&1 < /dev/null &
 

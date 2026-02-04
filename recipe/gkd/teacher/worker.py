@@ -31,12 +31,28 @@ def main():
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--ep-size", type=int, default=1)
     parser.add_argument("--dp-size", type=int, default=1)
+
+
+    # newly added vllm param to control memory usage
+    parser.add_argument("--enable-prefix-caching", action="store_true", default=False,
+                        help="Enable prefix caching (default: False)")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.85,
+                        help="GPU memory utilization (default: 0.85)")
+    parser.add_argument("--max-num-batched-tokens", type=int, default=None,
+                        help="Max number of batched tokens (default: None)")
+
     args = parser.parse_args()
 
     if args.backend == "vllm":
         from vllm_engine import VLLMEngine
-
-        engine = VLLMEngine(args.ckpt_path, args.n_logprobs, args.tp_size)
+        engine = VLLMEngine(
+            args.ckpt_path, 
+            args.n_logprobs, 
+            args.tp_size,
+            enable_prefix_caching=args.enable_prefix_caching,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            max_num_batched_tokens=args.max_num_batched_tokens,
+        )
     else:
         raise ValueError(f"Unknown backend: {args.backend}.")
 

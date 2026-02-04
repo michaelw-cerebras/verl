@@ -127,4 +127,4 @@ logs
 log
 outputs
 .history
-.pid
+*.pid

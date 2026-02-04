@@ -134,19 +134,29 @@ class LogprobsTensors(NamedTuple):
 
 
 class VLLMEngine:
-    def __init__(self, ckpt_path, n_logprobs=0, tp_size=1):
+    def __init__(self, ckpt_path, n_logprobs=0, tp_size=1, 
+                 enable_prefix_caching=False,
+                 gpu_memory_utilization=0.85,
+                 max_num_batched_tokens=None):
         self.n_logprobs = n_logprobs
         # self.llm = LLM(ckpt_path, tensor_parallel_size=tp_size, trust_remote_code=True,
         #                enable_chunked_prefill=False, distributed_executor_backend="ray",
         #                max_logprobs=n_logprobs, gpu_memory_utilization=0.7)
-        self.llm = LLM(
-            ckpt_path,
-            tensor_parallel_size=tp_size,
-            trust_remote_code=True,
-            enable_chunked_prefill=False,
-            max_logprobs=n_logprobs,
-            gpu_memory_utilization=0.7,
-        )
+
+        llm_kwargs = {
+            "tensor_parallel_size": tp_size,
+            "trust_remote_code": True,
+            "enable_chunked_prefill": False,
+            "max_logprobs": n_logprobs,
+            "enable_prefix_caching": enable_prefix_caching,
+            "gpu_memory_utilization": gpu_memory_utilization,
+        }
+        
+        if max_num_batched_tokens is not None:
+            llm_kwargs["max_num_batched_tokens"] = max_num_batched_tokens
+            llm_kwargs["max_model_len"] = max_num_batched_tokens
+        
+        self.llm = LLM(ckpt_path, **llm_kwargs)
 
     def get_topk_logprobs(self, prompt_token_ids, temperature=0.8, max_new_tokens=1, only_response=False):
         def make_sampling_params(i=None):
