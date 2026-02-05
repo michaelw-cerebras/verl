@@ -19,6 +19,16 @@ from typing import NamedTuple
 import torch
 from codetiming import Timer
 from transformers import AutoConfig
+
+# Patch vLLM's compute_logprobs for memory-efficient long sequence processing
+# This MUST be imported before vllm to apply the monkey-patch
+try:
+    from . import patch_vllm_logprobs
+    patch_vllm_logprobs.apply_patch(chunk_size=2048)
+except ImportError:
+    import patch_vllm_logprobs
+    patch_vllm_logprobs.apply_patch(chunk_size=2048)
+
 from vllm import LLM, SamplingParams
 
 # from vllm.v1.outputs import LogprobsTensors
