@@ -1776,12 +1776,19 @@ def compute_teacher_kl_loss(
     """
     import torch.nn.functional as F
 
+    original_dtype = student_logits.dtype
+
+    # Cast to fp32 for numerical stability in KL computation
+    # KL involves log_softmax, exp, and summation which can be unstable in bf16
+    student_logits_fp32 = student_logits.float()
+    teacher_topk_logps_fp32 = teacher_topk_logps.float()
+
     # Apply temperature scaling
     if temperature != 1.0:
-        student_logits = student_logits / temperature
+        student_logits_fp32 = student_logits_fp32 / temperature
 
     # Compute student log probabilities over full vocabulary
-    student_log_probs = F.log_softmax(student_logits, dim=-1)  # [batch, seq_len, vocab_size]
+    student_log_probs = F.log_softmax(student_logits_fp32, dim=-1)  # [batch, seq_len, vocab_size]
 
     # Gather student log probs at teacher's top-k indices
     # teacher_topk_indices: [batch, seq_len, topk]
@@ -1790,19 +1797,20 @@ def compute_teacher_kl_loss(
     )  # [batch, seq_len, topk]
 
     # Teacher probabilities from log probs
-    teacher_topk_probs = torch.exp(teacher_topk_logps)  # [batch, seq_len, topk]
+    teacher_topk_probs = torch.exp(teacher_topk_logps_fp32)  # [batch, seq_len, topk]
 
     # KL(P||Q) = sum_i P(i) * (log P(i) - log Q(i))
     # where P = teacher, Q = student
     per_token_kl = torch.sum(
-        teacher_topk_probs * (teacher_topk_logps - student_topk_log_probs),
+        teacher_topk_probs * (teacher_topk_logps_fp32 - student_topk_log_probs),
         dim=-1,
     )  # [batch, seq_len]
 
     # Zero out non-response positions
     per_token_kl = per_token_kl * response_mask.float()
 
-    return per_token_kl
+    # Cast back to original dtype
+    return per_token_kl.to(original_dtype)
 
 
 def compute_teacher_kl_loss_from_logprobs(
@@ -1886,10 +1894,10 @@ def compute_teacher_kl_loss_chunked(
 
     batch_size, seq_len, vocab_size = student_logits.shape
     device = student_logits.device
-    dtype = student_logits.dtype
+    original_dtype = student_logits.dtype
 
-    # Pre-allocate output tensor
-    per_token_kl = torch.zeros(batch_size, seq_len, device=device, dtype=dtype)
+    # Pre-allocate output tensor in original dtype
+    per_token_kl = torch.zeros(batch_size, seq_len, device=device, dtype=original_dtype)
 
     # Apply temperature scaling if needed
     if temperature != 1.0:
@@ -1901,19 +1909,21 @@ def compute_teacher_kl_loss_chunked(
     for start_idx in range(0, seq_len, chunk_size):
         end_idx = min(start_idx + chunk_size, seq_len)
 
-        # Get chunk of student logits
-        student_chunk = student_logits[:, start_idx:end_idx, :]  # [batch, chunk, vocab]
+        # Get chunk of student logits and cast to fp32 for numerical stability
+        # KL computation involves log_softmax, exp, and summation which can be unstable in bf16
+        student_chunk = student_logits[:, start_idx:end_idx, :].float()  # [batch, chunk, vocab]
 
         # Apply temperature if needed
         if temp_factor is not None:
             student_chunk = student_chunk * temp_factor
 
         # Compute log softmax for this chunk only (memory efficient)
+        # Using fp32 for numerical stability in softmax
         student_log_probs_chunk = F.log_softmax(student_chunk, dim=-1)  # [batch, chunk, vocab]
 
-        # Get corresponding teacher data
+        # Get corresponding teacher data and cast to fp32
         teacher_indices_chunk = teacher_topk_indices[:, start_idx:end_idx, :]  # [batch, chunk, topk]
-        teacher_logps_chunk = teacher_topk_logps[:, start_idx:end_idx, :]  # [batch, chunk, topk]
+        teacher_logps_chunk = teacher_topk_logps[:, start_idx:end_idx, :].float()  # [batch, chunk, topk]
         mask_chunk = response_mask[:, start_idx:end_idx]  # [batch, chunk]
 
         # Gather student log probs at teacher's top-k indices
@@ -1921,7 +1931,7 @@ def compute_teacher_kl_loss_chunked(
             student_log_probs_chunk, dim=-1, index=teacher_indices_chunk
         )  # [batch, chunk, topk]
 
-        # Compute teacher probabilities from log probs
+        # Compute teacher probabilities from log probs (fp32 for exp stability)
         teacher_topk_probs = torch.exp(teacher_logps_chunk)  # [batch, chunk, topk]
 
         # KL(P||Q) = sum_i P(i) * (log P(i) - log Q(i))
@@ -1933,8 +1943,8 @@ def compute_teacher_kl_loss_chunked(
         # Apply mask
         chunk_kl = chunk_kl * mask_chunk.float()
 
-        # Store result
-        per_token_kl[:, start_idx:end_idx] = chunk_kl
+        # Store result (cast back to original dtype)
+        per_token_kl[:, start_idx:end_idx] = chunk_kl.to(original_dtype)
 
         # Explicitly delete intermediate tensors to free memory
         del student_chunk, student_log_probs_chunk, student_topk_log_probs
