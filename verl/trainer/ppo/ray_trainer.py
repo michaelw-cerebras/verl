@@ -1345,17 +1345,33 @@ class RayPPOTrainer:
                 # ========== Get Teacher Knowledge for GKD ==========
                 if self.use_teacher_kl and self.teacher_client is not None:
                     with marked_timer("teacher_knowledge", timing_raw, color="orange"):
-                        from recipe.gkd.teacher_utils import get_teacher_knowledge
-
                         teacher_config = self.config.actor_rollout_ref.teacher
                         n_server_workers = getattr(teacher_config, "n_server_workers", 1)
 
-                        teacher_output = get_teacher_knowledge(
-                            batch=batch,
-                            teacher_client=self.teacher_client,
-                            n_server_workers=n_server_workers,
-                            is_async=False,
-                        )
+                        # Use chunked mode for long sequences to avoid vLLM OOM
+                        use_chunked = getattr(teacher_config, "use_chunked_logprobs", False)
+                        chunk_size = getattr(teacher_config, "logprob_chunk_size", 4096)
+                        prompt_length = int(self.config.data.max_prompt_length)
+
+                        if use_chunked:
+                            from recipe.gkd.teacher_utils import get_teacher_knowledge_chunked
+
+                            teacher_output = get_teacher_knowledge_chunked(
+                                batch=batch,
+                                teacher_client=self.teacher_client,
+                                n_server_workers=n_server_workers,
+                                chunk_size=chunk_size,
+                                prompt_length=prompt_length,
+                            )
+                        else:
+                            from recipe.gkd.teacher_utils import get_teacher_knowledge
+
+                            teacher_output = get_teacher_knowledge(
+                                batch=batch,
+                                teacher_client=self.teacher_client,
+                                n_server_workers=n_server_workers,
+                                is_async=False,
+                            )
                         # ===== Keep only response tokens for teacher KL =====
                         T_resp = int(self.config.data.max_response_length)
 
