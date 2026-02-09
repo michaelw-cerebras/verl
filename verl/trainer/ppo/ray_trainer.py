@@ -20,6 +20,8 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import random
+import time
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -31,7 +33,7 @@ import numpy as np
 import ray
 import torch
 from omegaconf import OmegaConf, open_dict
-from torch.utils.data import Dataset, Sampler
+from torch.utils.data import Dataset, Sampler, Subset
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
@@ -353,6 +355,37 @@ class RayPPOTrainer:
 
         self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
 
+        # Initialize teacher client for GKD (Generalized Knowledge Distillation)
+        self.teacher_client = None
+        self.use_teacher_kl = getattr(self.config.actor_rollout_ref.actor, "use_teacher_kl_loss", False)
+        self.gkd_only_mode = getattr(self.config.actor_rollout_ref.actor, "gkd_only_mode", False)
+
+        # GKD off-policy settings
+        self.enable_off_policy = self.config.trainer.get("enable_off_policy", False)
+        self.gkd_lambda = float(self.config.trainer.get("gkd_lambda", 1.0))
+        self.gkd_lambda = max(0.0, min(1.0, self.gkd_lambda))
+
+        # GKD selection strategy for GRPO + GKD mode (when rollout.n > 1)
+        self.gkd_select_strategy = self.config.actor_rollout_ref.actor.get("gkd_select_strategy", "all")
+        self.gkd_select_k = self.config.actor_rollout_ref.actor.get("gkd_select_k", 1)
+
+        if self.use_teacher_kl:
+            teacher_config = getattr(self.config.actor_rollout_ref, "teacher", None)
+            if teacher_config is not None:
+                from recipe.gkd.teacher.client import TeacherClient
+
+                self.teacher_client = TeacherClient(
+                    server_ip=teacher_config.server_ip,
+                    server_port=teacher_config.server_port,
+                    n_server_workers=getattr(teacher_config, "n_server_workers", 1),
+                    temperature=getattr(teacher_config, "temperature", 1.0),
+                    only_response=getattr(teacher_config, "only_response", False),
+                )
+                print(f"[GKD] Initialized TeacherClient: {teacher_config.server_ip}:{teacher_config.server_port}"
+                      f" (only_response={getattr(teacher_config, 'only_response', False)})")
+            else:
+                raise ValueError("use_teacher_kl_loss=True but no teacher config found in actor_rollout_ref.teacher")
+
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
@@ -398,6 +431,42 @@ class RayPPOTrainer:
             sampler=train_sampler,
         )
 
+        # Store dataloader params for off-policy mixing (used in _create_continuous_iterator)
+        self._collate_fn = collate_fn
+        self._num_workers = num_workers
+        self._on_batch_size = self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
+        self._off_batch_size = self.config.data.get("off_policy_batch_size") or self.config.data.train_batch_size
+        self._drop_last = True
+
+        # Create off-policy dataloader if enabled
+        self.off_policy_dataloader = None
+        self.off_policy_dataset = None
+        if self.enable_off_policy:
+            from recipe.gkd.off_policy_dataset import GKDOffPolicyDataset
+
+            if self.config.data.get("off_policy_files") is not None:
+                print("[GKD] Creating off-policy dataloader with ground truth answers...")
+                self.off_policy_dataset = GKDOffPolicyDataset(
+                    self.config.data.off_policy_files, self.tokenizer, self.config.data
+                )
+                off_policy_batch_size = self.config.data.get("off_policy_batch_size")
+                if off_policy_batch_size is None:
+                    off_policy_batch_size = self.config.data.train_batch_size
+
+                self.off_policy_dataloader = StatefulDataLoader(
+                    dataset=self.off_policy_dataset,
+                    batch_size=off_policy_batch_size,
+                    num_workers=num_workers,
+                    drop_last=True,
+                    collate_fn=collate_fn,
+                    shuffle=self.config.data.get("shuffle", True),
+                )
+                print(f"[GKD] Size of off-policy dataloader: {len(self.off_policy_dataloader)}")
+            else:
+                raise ValueError(
+                    "enable_off_policy is True but off_policy_files is not set in config.data.off_policy_files"
+                )
+
         val_batch_size = self.config.data.val_batch_size  # Prefer config value if set
         if val_batch_size is None:
             val_batch_size = len(self.val_dataset)
@@ -436,6 +505,173 @@ class RayPPOTrainer:
                     self.config.critic.optim.total_training_steps = total_training_steps
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
+
+    def _create_continuous_iterator(self):
+        """
+        Create a continuous data iterator across epochs.
+        If off-policy is enabled, we do *disjoint partition* of sample indices per epoch:
+        - shuffle all sample indices once
+        - split into on_ids / off_ids by gkd_lambda
+        - build per-epoch dataloaders on Subset(train_dataset) and Subset(off_policy_dataset)
+        - then shuffle the *source sequence* (on vs off) so training sees a mixed stream
+        This guarantees: within an epoch, a sample is used by at most one of {on, off}.
+        """
+        # If off-policy disabled or lambda==1 -> original pure on-policy behavior
+        if (not self.enable_off_policy) or (self.off_policy_dataloader is None) or (self.gkd_lambda >= 1.0 - 1e-12):
+            for epoch in range(self.config.trainer.total_epochs):
+                on_it = iter(self.train_dataloader)
+                for _ in range(len(self.train_dataloader)):
+                    batch_dict = next(on_it)
+                    batch_dict["is_on_policy"] = True
+                    yield epoch, batch_dict
+            return
+
+        # If lambda==0 -> pure off-policy behavior
+        if self.gkd_lambda <= 1e-12:
+            for epoch in range(self.config.trainer.total_epochs):
+                off_it = iter(self.off_policy_dataloader)
+                for _ in range(len(self.off_policy_dataloader)):
+                    batch_dict = next(off_it)
+                    batch_dict["is_on_policy"] = False
+                    yield epoch, batch_dict
+            return
+
+        # Disjoint partition mode (0 < lambda < 1)
+        base_seed = int(self.config.trainer.get("data_partition_seed", 12345))
+
+        train_ds = self.train_dataset
+        off_ds = self.off_policy_dataset
+
+        N = len(train_ds)
+        assert len(off_ds) == N, (
+            f"Disjoint partition requires on/off datasets aligned with same length. "
+            f"Got len(train)={len(train_ds)} len(off)={len(off_ds)}"
+        )
+
+        for epoch in range(self.config.trainer.total_epochs):
+            rng = random.Random(base_seed + epoch)
+            indices = list(range(N))
+            rng.shuffle(indices)
+
+            n_on = int(round(self.gkd_lambda * N))
+            on_ids = indices[:n_on]
+            off_ids = indices[n_on:]
+
+            on_subset = Subset(train_ds, on_ids)
+            off_subset = Subset(off_ds, off_ids)
+
+            on_loader = StatefulDataLoader(
+                dataset=on_subset,
+                batch_size=self._on_batch_size,
+                num_workers=self._num_workers,
+                drop_last=self._drop_last,
+                collate_fn=self._collate_fn,
+                shuffle=False,
+            )
+
+            off_loader = StatefulDataLoader(
+                dataset=off_subset,
+                batch_size=self._off_batch_size,
+                num_workers=self._num_workers,
+                drop_last=self._drop_last,
+                collate_fn=self._collate_fn,
+                shuffle=False,
+            )
+
+            on_steps = len(on_loader)
+            off_steps = len(off_loader)
+
+            schedule = [True] * on_steps + [False] * off_steps
+            rng.shuffle(schedule)
+
+            on_it = iter(on_loader)
+            off_it = iter(off_loader)
+
+            for use_on in schedule:
+                if use_on:
+                    batch_dict = next(on_it)
+                    batch_dict["is_on_policy"] = True
+                else:
+                    batch_dict = next(off_it)
+                    batch_dict["is_on_policy"] = False
+                yield epoch, batch_dict
+
+    def _compute_gkd_select_mask(self, batch: DataProto, n_repeat: int) -> torch.Tensor:
+        """
+        Compute a boolean mask indicating which samples should have teacher KL loss applied.
+        For GRPO + GKD mode, we may want to only apply teacher KL on a subset of the n responses
+        per prompt, based on the selection strategy.
+        """
+        batch_size = len(batch.batch["input_ids"])
+        strategy = self.gkd_select_strategy
+        k = min(self.gkd_select_k, n_repeat)
+
+        if self.gkd_only_mode or n_repeat == 1:
+            return torch.ones(batch_size, dtype=torch.bool)
+
+        if strategy == "all":
+            return torch.ones(batch_size, dtype=torch.bool)
+
+        n_prompts = batch_size // n_repeat
+        mask = torch.zeros(batch_size, dtype=torch.bool)
+
+        if strategy == "random":
+            for i in range(n_prompts):
+                start_idx = i * n_repeat
+                selected = random.sample(range(n_repeat), k)
+                for s in selected:
+                    mask[start_idx + s] = True
+
+        elif strategy == "best":
+            if "token_level_scores" not in batch.batch:
+                print("[GKD] Warning: 'best' strategy requires rewards, falling back to 'all'")
+                return torch.ones(batch_size, dtype=torch.bool)
+
+            rewards = batch.batch["token_level_scores"].sum(dim=-1)
+            for i in range(n_prompts):
+                start_idx = i * n_repeat
+                end_idx = start_idx + n_repeat
+                group_rewards = rewards[start_idx:end_idx]
+                _, topk_indices = torch.topk(group_rewards, k)
+                for idx in topk_indices:
+                    mask[start_idx + idx] = True
+
+        elif strategy == "worst":
+            if "token_level_scores" not in batch.batch:
+                print("[GKD] Warning: 'worst' strategy requires rewards, falling back to 'all'")
+                return torch.ones(batch_size, dtype=torch.bool)
+
+            rewards = batch.batch["token_level_scores"].sum(dim=-1)
+            for i in range(n_prompts):
+                start_idx = i * n_repeat
+                end_idx = start_idx + n_repeat
+                group_rewards = rewards[start_idx:end_idx]
+                _, bottomk_indices = torch.topk(group_rewards, k, largest=False)
+                for idx in bottomk_indices:
+                    mask[start_idx + idx] = True
+        else:
+            raise ValueError(f"Unknown gkd_select_strategy: {strategy}")
+
+        return mask
+
+    def _ensure_rl_metric_keys(self, batch):
+        """
+        In gkd_only_mode we skip reward/advantage/rl pipeline, but metric_utils
+        assumes RL keys exist. Create zero placeholders to make logging robust.
+        """
+        assert "response_mask" in batch.batch.keys()
+        resp_mask = batch.batch["response_mask"]
+        B, T = resp_mask.shape
+        zeros_f = torch.zeros((B, T), device=resp_mask.device, dtype=torch.float32)
+
+        batch.batch.setdefault("token_level_scores", zeros_f)
+        batch.batch.setdefault("token_level_rewards", zeros_f)
+        batch.batch.setdefault("advantages", zeros_f)
+        batch.batch.setdefault("returns", zeros_f)
+        batch.batch.setdefault("old_log_probs", zeros_f)
+        batch.batch.setdefault("ref_log_prob", zeros_f)
+        batch.batch.setdefault("values", zeros_f)
+        batch.batch.setdefault("entropys", zeros_f)
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""
@@ -1324,10 +1560,25 @@ class RayPPOTrainer:
         )
         next_step_profile = False
 
-        for epoch in range(current_epoch, self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
+        # Use continuous iterator for GKD off-policy support, or fall back to standard loop
+        use_continuous_iter = self.enable_off_policy and self.off_policy_dataloader is not None
+        if use_continuous_iter:
+            data_iter = self._create_continuous_iterator()
+        else:
+            # Wrap the standard dataloader loop to match the continuous iterator interface
+            def _standard_iter():
+                for epoch in range(current_epoch, self.config.trainer.total_epochs):
+                    for batch_dict in self.train_dataloader:
+                        batch_dict["is_on_policy"] = True
+                        yield epoch, batch_dict
+            data_iter = _standard_iter()
+
+        for epoch, batch_dict in data_iter:
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
+
+                is_on_policy = batch_dict.pop("is_on_policy", True)
+
                 metrics = {}
                 timing_raw = {}
 
@@ -1416,147 +1667,209 @@ class RayPPOTrainer:
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
-                    with marked_timer("reward", timing_raw, color="yellow"):
-                        # compute reward model score
-                        if self.use_rm and "rm_scores" not in batch.batch.keys():
-                            if not self.use_reward_loop:
-                                reward_tensor = self.rm_wg.compute_rm_score(batch)
-                            else:
-                                assert self.reward_loop_manager is not None, "RewardLoopManager is None"
-                                reward_tensor = self.reward_loop_manager.compute_rm_score(batch)
-                            batch = batch.union(reward_tensor)
+                    # ── GKD-only mode: skip RL pipeline, just do teacher KL + actor update ──
+                    if self.gkd_only_mode:
+                        reward_extra_infos_dict = {}
+                        self._ensure_rl_metric_keys(batch)
 
-                        # Compute or extract reward for training
-                        if self.config.reward_model.launch_reward_fn_async:
-                            future_reward = compute_reward_async.remote(
-                                data=batch, config=self.config, tokenizer=self.tokenizer
-                            )
-                        else:
-                            reward_tensor, reward_extra_infos_dict = self._compute_or_extract_reward(
-                                batch, reward_fn=self.reward_fn, return_dict=False
-                            )
+                        # Fetch teacher knowledge
+                        if self.use_teacher_kl and self.teacher_client is not None:
+                            with marked_timer("teacher_kl", timing_raw, color="magenta"):
+                                from recipe.gkd.teacher_utils import get_teacher_knowledge
 
-                    # Operating Mode Selection:
-                    # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
-                    # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
-                    #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
-                    rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
-                    bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
-                    if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
-                        from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
+                                teacher_config = self.config.actor_rollout_ref.teacher
+                                teacher_output = get_teacher_knowledge(
+                                    batch,
+                                    self.teacher_client,
+                                    n_server_workers=getattr(teacher_config, "n_server_workers", 1),
+                                    temperature=getattr(teacher_config, "temperature", 1.0),
+                                    only_response=getattr(teacher_config, "only_response", False),
+                                )
+                                batch = batch.union(teacher_output)
 
-                        apply_bypass_mode(
-                            batch=batch,
-                            rollout_corr_config=rollout_corr_config,
-                            policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
-                        )
-                    else:  # Recompute old_log_probs
-                        with marked_timer("old_log_prob", timing_raw, color="blue"):
-                            old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
-                            entropys = old_log_prob.batch["entropys"]
-                            response_masks = batch.batch["response_mask"]
-                            actor_config = self.config.actor_rollout_ref.actor
-                            entropy_agg = agg_loss(
-                                loss_mat=entropys,
-                                loss_mask=response_masks,
-                                loss_agg_mode=actor_config.loss_agg_mode,
-                                loss_scale_factor=actor_config.loss_scale_factor,
-                            )
-                            old_log_prob_metrics = {
-                                "actor/entropy": entropy_agg.detach().item(),
-                                "perf/mfu/actor_infer": old_log_prob_mfu,
-                            }
-                            metrics.update(old_log_prob_metrics)
-                            old_log_prob.batch.pop("entropys")
-                            batch = batch.union(old_log_prob)
-                            if "rollout_log_probs" in batch.batch.keys():
-                                # TODO: we may want to add diff of probs too.
-                                from verl.utils.debug.metrics import calculate_debug_metrics
+                                n_repeat = self.config.actor_rollout_ref.rollout.n
+                                gkd_select_mask = self._compute_gkd_select_mask(batch, n_repeat)
+                                batch.batch["gkd_select_mask"] = gkd_select_mask
 
-                                metrics.update(calculate_debug_metrics(batch))
+                                metrics["gkd/is_on_policy"] = float(is_on_policy)
+                                metrics["gkd/teacher_kl_enabled"] = 1.0
+                                metrics["gkd/gkd_only_mode"] = 1.0
+                                metrics["gkd/select_mask_ratio"] = float(gkd_select_mask.float().mean().item())
 
-                    assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
-
-                    if self.use_reference_policy:
-                        # compute reference log_prob
-                        with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
-                            ref_log_prob = self._compute_ref_log_prob(batch)
-                            batch = batch.union(ref_log_prob)
-
-                    # compute values
-                    if self.use_critic:
-                        with marked_timer("values", timing_raw, color="cyan"):
-                            values = self._compute_values(batch)
-                            batch = batch.union(values)
-
-                    with marked_timer("adv", timing_raw, color="brown"):
-                        # we combine with rule-based rm
-                        reward_extra_infos_dict: dict[str, list]
-                        if self.config.reward_model.launch_reward_fn_async:
-                            reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
-                        batch.batch["token_level_scores"] = reward_tensor
-
-                        if reward_extra_infos_dict:
-                            batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
-
-                        # compute rewards. apply_kl_penalty if available
-                        if self.config.algorithm.use_kl_in_reward:
-                            batch, kl_metrics = apply_kl_penalty(
-                                batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
-                            )
-                            metrics.update(kl_metrics)
-                        else:
-                            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
-
-                        # Compute rollout correction: IS weights, rejection sampling, and metrics
-                        # Only runs in decoupled mode (computes once per batch using stable π_old)
-                        # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
-                        if (
-                            rollout_corr_config is not None
-                            and "rollout_log_probs" in batch.batch
-                            and not bypass_recomputing_logprobs  # Only in decoupled mode
-                        ):
-                            from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
-
-                            # Compute IS weights, apply rejection sampling, compute metrics
-                            batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
-                            # IS and off-policy metrics already have rollout_corr/ prefix
-                            metrics.update(is_metrics)
-
-                        # compute advantages, executed on the driver process
-                        norm_adv_by_std_in_grpo = self.config.algorithm.get(
-                            "norm_adv_by_std_in_grpo", True
-                        )  # GRPO adv normalization factor
-
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            config=self.config.algorithm,
-                        )
-
-                    # update critic
-                    if self.use_critic:
-                        with marked_timer("update_critic", timing_raw, color="pink"):
-                            critic_output = self._update_critic(batch)
-                        critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
-                        metrics.update(critic_output_metrics)
-
-                    # implement critic warmup
-                    if self.config.trainer.critic_warmup <= self.global_steps:
-                        # update actor
+                        # update actor with teacher KL loss only
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self._update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
-                    # Log rollout generations if enabled
-                    rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-                    if rollout_data_dir:
-                        self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+                    else:
+                        # ── Standard RL pipeline (PPO/GRPO + optional GKD) ──
+
+                        with marked_timer("reward", timing_raw, color="yellow"):
+                            # compute reward model score
+                            if self.use_rm and "rm_scores" not in batch.batch.keys():
+                                if not self.use_reward_loop:
+                                    reward_tensor = self.rm_wg.compute_rm_score(batch)
+                                else:
+                                    assert self.reward_loop_manager is not None, "RewardLoopManager is None"
+                                    reward_tensor = self.reward_loop_manager.compute_rm_score(batch)
+                                batch = batch.union(reward_tensor)
+
+                            # Compute or extract reward for training
+                            if self.config.reward_model.launch_reward_fn_async:
+                                future_reward = compute_reward_async.remote(
+                                    data=batch, config=self.config, tokenizer=self.tokenizer
+                                )
+                            else:
+                                reward_tensor, reward_extra_infos_dict = self._compute_or_extract_reward(
+                                    batch, reward_fn=self.reward_fn, return_dict=False
+                                )
+
+                        # Operating Mode Selection:
+                        # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
+                        # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
+                        #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
+                        rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+                        bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+                        if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
+                            from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
+
+                            apply_bypass_mode(
+                                batch=batch,
+                                rollout_corr_config=rollout_corr_config,
+                                policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
+                            )
+                        else:  # Recompute old_log_probs
+                            with marked_timer("old_log_prob", timing_raw, color="blue"):
+                                old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
+                                entropys = old_log_prob.batch["entropys"]
+                                response_masks = batch.batch["response_mask"]
+                                actor_config = self.config.actor_rollout_ref.actor
+                                entropy_agg = agg_loss(
+                                    loss_mat=entropys,
+                                    loss_mask=response_masks,
+                                    loss_agg_mode=actor_config.loss_agg_mode,
+                                    loss_scale_factor=actor_config.loss_scale_factor,
+                                )
+                                old_log_prob_metrics = {
+                                    "actor/entropy": entropy_agg.detach().item(),
+                                    "perf/mfu/actor_infer": old_log_prob_mfu,
+                                }
+                                metrics.update(old_log_prob_metrics)
+                                old_log_prob.batch.pop("entropys")
+                                batch = batch.union(old_log_prob)
+                                if "rollout_log_probs" in batch.batch.keys():
+                                    # TODO: we may want to add diff of probs too.
+                                    from verl.utils.debug.metrics import calculate_debug_metrics
+
+                                    metrics.update(calculate_debug_metrics(batch))
+
+                        assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
+
+                        if self.use_reference_policy:
+                            # compute reference log_prob
+                            with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
+                                ref_log_prob = self._compute_ref_log_prob(batch)
+                                batch = batch.union(ref_log_prob)
+
+                        # compute values
+                        if self.use_critic:
+                            with marked_timer("values", timing_raw, color="cyan"):
+                                values = self._compute_values(batch)
+                                batch = batch.union(values)
+
+                        with marked_timer("adv", timing_raw, color="brown"):
+                            # we combine with rule-based rm
+                            reward_extra_infos_dict: dict[str, list]
+                            if self.config.reward_model.launch_reward_fn_async:
+                                reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+                            batch.batch["token_level_scores"] = reward_tensor
+
+                            if reward_extra_infos_dict:
+                                batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+
+                            # compute rewards. apply_kl_penalty if available
+                            if self.config.algorithm.use_kl_in_reward:
+                                batch, kl_metrics = apply_kl_penalty(
+                                    batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
+                                )
+                                metrics.update(kl_metrics)
+                            else:
+                                batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+                            # Compute rollout correction: IS weights, rejection sampling, and metrics
+                            # Only runs in decoupled mode (computes once per batch using stable π_old)
+                            # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
+                            if (
+                                rollout_corr_config is not None
+                                and "rollout_log_probs" in batch.batch
+                                and not bypass_recomputing_logprobs  # Only in decoupled mode
+                            ):
+                                from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
+
+                                # Compute IS weights, apply rejection sampling, compute metrics
+                                batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
+                                # IS and off-policy metrics already have rollout_corr/ prefix
+                                metrics.update(is_metrics)
+
+                            # compute advantages, executed on the driver process
+                            norm_adv_by_std_in_grpo = self.config.algorithm.get(
+                                "norm_adv_by_std_in_grpo", True
+                            )  # GRPO adv normalization factor
+
+                            batch = compute_advantage(
+                                batch,
+                                adv_estimator=self.config.algorithm.adv_estimator,
+                                gamma=self.config.algorithm.gamma,
+                                lam=self.config.algorithm.lam,
+                                num_repeat=self.config.actor_rollout_ref.rollout.n,
+                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                                config=self.config.algorithm,
+                            )
+
+                        # update critic
+                        if self.use_critic:
+                            with marked_timer("update_critic", timing_raw, color="pink"):
+                                critic_output = self._update_critic(batch)
+                            critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
+                            metrics.update(critic_output_metrics)
+
+                        # ── GKD: fetch teacher knowledge (combined RL + GKD mode) ──
+                        if self.use_teacher_kl and self.teacher_client is not None:
+                            with marked_timer("teacher_kl", timing_raw, color="magenta"):
+                                from recipe.gkd.teacher_utils import get_teacher_knowledge
+
+                                teacher_config = self.config.actor_rollout_ref.teacher
+                                teacher_output = get_teacher_knowledge(
+                                    batch,
+                                    self.teacher_client,
+                                    n_server_workers=getattr(teacher_config, "n_server_workers", 1),
+                                    temperature=getattr(teacher_config, "temperature", 1.0),
+                                    only_response=getattr(teacher_config, "only_response", False),
+                                )
+                                batch = batch.union(teacher_output)
+
+                                # Compute GKD select mask (for GRPO + GKD)
+                                n_repeat = self.config.actor_rollout_ref.rollout.n
+                                gkd_select_mask = self._compute_gkd_select_mask(batch, n_repeat)
+                                batch.batch["gkd_select_mask"] = gkd_select_mask
+
+                                metrics["gkd/is_on_policy"] = float(is_on_policy)
+                                metrics["gkd/teacher_kl_enabled"] = 1.0
+                                metrics["gkd/select_mask_ratio"] = float(gkd_select_mask.float().mean().item())
+
+                        # implement critic warmup
+                        if self.config.trainer.critic_warmup <= self.global_steps:
+                            # update actor
+                            with marked_timer("update_actor", timing_raw, color="red"):
+                                actor_output = self._update_actor(batch)
+                            actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                            metrics.update(actor_output_metrics)
+
+                        # Log rollout generations if enabled
+                        rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+                        if rollout_data_dir:
+                            self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
                 # validate
                 if (
