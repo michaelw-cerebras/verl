@@ -5,21 +5,44 @@ This directory contains a configuration for running validation-only evaluation o
 ## Quick Start
 
 ### Basic Evaluation
+
+**Option 1: Use your existing training script (simplest)**
 ```bash
-bash examples/ppo_trainer/evaluate_gsm8k.sh
+# Just add trainer.val_only=true to your training script
+bash your_train_script.sh trainer.val_only=true trainer.val_before_train=true
+```
+
+**Option 2: Use the evaluation-only config**
+```bash
+# Use the cleaned-up eval config
+python3 -m verl.trainer.main_ppo \
+    --config-path=examples/ppo_trainer \
+    --config-name=gsm8k_eval_only
 ```
 
 This will evaluate the default model (`Qwen/Qwen2.5-0.5B-Instruct`) on the GSM8K test set.
 
 ### Evaluate a Checkpoint
+
+**Using your training script:**
 ```bash
-bash examples/ppo_trainer/evaluate_gsm8k.sh \
+bash your_train_script.sh \
+    trainer.val_only=true \
+    actor_rollout_ref.model.path=/path/to/checkpoint/global_step_1000
+```
+
+**Using the eval config:**
+```bash
+python3 -m verl.trainer.main_ppo \
+    --config-path=examples/ppo_trainer \
+    --config-name=gsm8k_eval_only \
     actor_rollout_ref.model.path=/path/to/checkpoint/global_step_1000
 ```
 
 ### Evaluate with Different Parameters
 ```bash
-bash examples/ppo_trainer/evaluate_gsm8k.sh \
+bash your_train_script.sh \
+    trainer.val_only=true \
     actor_rollout_ref.model.path=meta-llama/Llama-3.2-1B-Instruct \
     actor_rollout_ref.rollout.val_kwargs.temperature=0 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=false \
@@ -28,16 +51,30 @@ bash examples/ppo_trainer/evaluate_gsm8k.sh \
 
 ## How It Works
 
-The evaluation mode is enabled by two key settings in `gsm8k_eval_only.yaml`:
+The evaluation mode is enabled by two key settings:
 
 ```yaml
 trainer:
   val_only: true        # Only run validation, skip training
   val_before_train: true # Trigger validation immediately
-  total_epochs: 0       # No training epochs
+  total_epochs: 0       # No training epochs (optional, for clarity)
 ```
 
-This reuses the exact same validation logic as during training, ensuring consistency.
+**Two ways to use this:**
+
+1. **Override your training config** (simplest):
+   ```bash
+   bash your_train_script.sh trainer.val_only=true trainer.val_before_train=true
+   ```
+
+2. **Use the dedicated eval config** (cleaner, removes unnecessary components):
+   ```bash
+   python3 -m verl.trainer.main_ppo \
+       --config-path=examples/ppo_trainer \
+       --config-name=gsm8k_eval_only
+   ```
+
+Both reuse the exact same validation logic as during training, ensuring consistency.
 
 ## Configuration Parameters
 
@@ -138,21 +175,24 @@ Key metrics:
 
 ### Example 1: Quick Test on 100 Samples
 ```bash
-bash examples/ppo_trainer/evaluate_gsm8k.sh \
+bash your_train_script.sh \
+    trainer.val_only=true \
     data.val_max_samples=100 \
     trainer.log_val_generations=5
 ```
 
 ### Example 2: Evaluate Training Checkpoint
 ```bash
-bash examples/ppo_trainer/evaluate_gsm8k.sh \
+bash your_train_script.sh \
+    trainer.val_only=true \
     actor_rollout_ref.model.path=checkpoints/my_project/my_experiment/actor/global_step_500 \
     trainer.validation_data_dir=./eval_results/step_500
 ```
 
 ### Example 3: Majority Voting Evaluation
 ```bash
-bash examples/ppo_trainer/evaluate_gsm8k.sh \
+bash your_train_script.sh \
+    trainer.val_only=true \
     actor_rollout_ref.model.path=Qwen/Qwen2.5-0.5B-Instruct \
     actor_rollout_ref.rollout.val_kwargs.n=5 \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.7 \
@@ -162,7 +202,8 @@ bash examples/ppo_trainer/evaluate_gsm8k.sh \
 
 ### Example 4: Multi-GPU Evaluation (Large Model)
 ```bash
-bash examples/ppo_trainer/evaluate_gsm8k.sh \
+bash your_train_script.sh \
+    trainer.val_only=true \
     actor_rollout_ref.model.path=Qwen/Qwen2.5-7B-Instruct \
     trainer.n_gpus_per_node=4 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
@@ -171,7 +212,8 @@ bash examples/ppo_trainer/evaluate_gsm8k.sh \
 
 ### Example 5: Evaluate with WandB Logging
 ```bash
-bash examples/ppo_trainer/evaluate_gsm8k.sh \
+bash your_train_script.sh \
+    trainer.val_only=true \
     trainer.project_name=my_evaluation_project \
     trainer.experiment_name=eval_qwen_0.5b_baseline \
     'trainer.logger=["console","wandb"]'
