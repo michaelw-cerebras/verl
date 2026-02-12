@@ -1,0 +1,163 @@
+# GSM8K Evaluation-Only Configuration
+#
+# Usage:
+#   bash evaluate_gsm8k.sh
+#
+# Or with overrides:
+#   bash evaluate_gsm8k.sh actor_rollout_ref.model.path=/path/to/checkpoint
+#
+# This config runs validation only (no training) by setting:
+#   - trainer.val_only: true
+#   - trainer.val_before_train: true
+#
+# All training-related components (teacher, critic, optimizer, etc.) are removed.
+
+defaults:
+  # Inherit from base PPO trainer config
+  - /ppo_trainer@_here_
+
+# ============================================================
+# Sequence Length Configuration
+# ============================================================
+_seq_config:
+  max_prompt_length: 512
+  max_response_length: 1024
+  max_total_length: 1536  # prompt + response
+
+# ============================================================
+# Data Configuration (Validation Only)
+# ============================================================
+data:
+  # Only val_files needed for evaluation
+  val_files: /workspace/mlf2/verl/reproduce/data/gsm8k/local_parquet_dir/test.parquet
+
+  # Batch size for validation
+  val_batch_size: 18
+
+  # Sequence length limits
+  max_prompt_length: ${_seq_config.max_prompt_length}
+  max_response_length: ${_seq_config.max_response_length}
+  filter_overlong_prompts: true
+  truncation: left
+
+  # Optional: limit number of validation samples for quick testing
+  # val_max_samples: 100
+
+  # Data format
+  prompt_key: prompt
+  reward_fn_key: data_source
+  dataloader_num_workers: 0
+
+# ============================================================
+# Model Configuration
+# ============================================================
+actor_rollout_ref:
+  model:
+    # Change this to evaluate different models/checkpoints
+    path: Qwen/Qwen2.5-0.5B-Instruct
+    # path: /path/to/your/checkpoint/global_step_1000
+
+    # No need to remove padding for evaluation only
+    use_remove_padding: true
+
+    # Can disable gradient checkpointing for evaluation (faster)
+    enable_gradient_checkpointing: false
+
+  # ============================================================
+  # Actor Configuration (Minimal for Evaluation)
+  # ============================================================
+  actor:
+    # FSDP2 backend (or use fsdp/megatron based on your setup)
+    strategy: fsdp2
+
+    fsdp_config:
+      model_dtype: fp32
+      # No need for offloading in eval mode
+      param_offload: false
+      optimizer_offload: false
+
+    # No optimizer needed for evaluation
+    # optim section removed
+
+    # GKD-specific flags (not used in validation, but kept for compatibility)
+    use_teacher_kl_loss: false
+    gkd_only_mode: false
+
+  # ============================================================
+  # Rollout (vLLM) Configuration
+  # ============================================================
+  rollout:
+    name: vllm
+    mode: sync
+    enable_chunked_prefill: true
+    max_num_batched_tokens: ${_seq_config.max_total_length}
+    tensor_model_parallel_size: 1
+    gpu_memory_utilization: 0.9  # Can use more GPU memory in eval mode
+
+    # Validation sampling parameters (matching val_kwargs in rollout.yaml)
+    val_kwargs:
+      _target_: verl.workers.config.SamplingConfig
+
+      # Greedy decoding for deterministic results (default validation setting)
+      temperature: 0
+      do_sample: false
+      top_k: -1
+      top_p: 1.0
+      n: 1  # Number of responses per prompt (increase for majority voting)
+
+    # Training rollout params (not used in validation, but kept for compatibility)
+    n: 1
+    temperature: 0.6
+    top_p: 0.95
+
+    # Qwen3 stop token IDs (remove for Qwen2)
+    stop_token_ids: [151645, 151643]
+
+# ============================================================
+# Trainer Configuration (Evaluation Only)
+# ============================================================
+trainer:
+  # CRITICAL: These settings enable validation-only mode
+  val_only: true
+  val_before_train: true
+
+  # No training, so these don't matter but set for clarity
+  total_epochs: 0
+  test_freq: -1
+  save_freq: -1
+
+  # Logging configuration
+  logger: ["console", "wandb"]
+  project_name: mw_verl_evaluation
+  experiment_name: eval_gsm8k_qwen2p5_0p5b
+
+  # Hardware configuration
+  n_gpus_per_node: 1  # Can use fewer GPUs for evaluation
+  nnodes: 1
+
+  # Optional: dump validation outputs to file for inspection
+  # validation_data_dir: ./validation_outputs
+
+  # Optional: log sample generations to console/wandb
+  # log_val_generations: 5
+
+# ============================================================
+# Reward Model Configuration
+# ============================================================
+reward_model:
+  enable: true
+  # GSM8K uses rule-based reward (not model-based)
+  # Reward is computed by verl.utils.reward_score.gsm8k.compute_score()
+
+# ============================================================
+# Removed Configurations (Not Needed for Evaluation)
+# ============================================================
+# - teacher: Not needed (only for GKD training)
+# - critic: Not needed (only for PPO training)
+# - actor.optim: Not needed (no training)
+# - train_files: Not needed (no training)
+# - off_policy_files: Not needed (no training)
+# - train_batch_size: Not needed (no training)
+# - train_max_samples: Not needed (no training)
+# - gkd_lambda: Not needed (no training)
+# - enable_off_policy: Not needed (no training)
