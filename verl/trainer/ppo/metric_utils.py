@@ -508,6 +508,34 @@ def calc_maj_val(data: list[dict[str, Any]], vote_key: str, val_key: str) -> flo
     return maj_val
 
 
+def calc_pass_at_n(data: list[dict[str, Any]], val_key: str, threshold: float = 0.99) -> float:
+    """
+    Calculate pass@n: returns 1.0 if at least one value meets the threshold.
+
+    This implements the "pass@k" metric where a question is considered passed
+    if at least one of k attempts is correct. This measures the model's boundary
+    capability - what it can achieve when given multiple chances.
+
+    Args:
+        data: List of dictionaries containing val_key.
+        val_key: The key to check for correctness/reward.
+        threshold: Value threshold to consider as "passed" (default 0.99 for binary accuracy).
+
+    Returns:
+        1.0 if at least one value >= threshold, else 0.0.
+
+    Example:
+        >>> data = [{"val": 0.0}, {"val": 0.0}, {"val": 1.0}]
+        >>> calc_pass_at_n(data, val_key="val")
+        1.0  # At least one correct
+        >>> data = [{"val": 0.0}, {"val": 0.0}, {"val": 0.0}]
+        >>> calc_pass_at_n(data, val_key="val")
+        0.0  # None correct
+    """
+    vals = [d[val_key] for d in data]
+    return 1.0 if any(v >= threshold for v in vals) else 0.0
+
+
 def process_validation_metrics(
     data_sources: list[str], sample_uids: list[str], infos_dict: dict[str, list[Any]], seed: int = 42
 ) -> dict[str, dict[str, dict[str, float]]]:
@@ -544,6 +572,8 @@ def process_validation_metrics(
         - "worst@N/std": Standard deviation of the worst values in bootstrap samples
         - "maj@N/mean": Mean of majority voting results in bootstrap samples (if "pred" exists)
         - "maj@N/std": Standard deviation of majority voting results (if "pred" exists)
+        - "pass@N/mean": Mean of pass@k results (1.0 if at least one correct, else 0.0)
+        - "pass@N/std": Standard deviation of pass@k results
 
     Example:
         >>> data_sources = ["source1", "source1", "source2"]
@@ -640,6 +670,18 @@ def process_validation_metrics(
                             )
                             metric[f"maj@{n}/mean"] = maj_n_mean
                             metric[f"maj@{n}/std"] = maj_n_std
+
+                        # compute pass@n metrics
+                        val_data = [{"val": val} for val in var_vals]
+                        [(pass_n_mean, pass_n_std)] = bootstrap_metric(
+                            data=val_data,
+                            subset_size=n,
+                            reduce_fns=[partial(calc_pass_at_n, val_key="val")],
+                            n_bootstrap=n_bootstrap,
+                            seed=seed,
+                        )
+                        metric[f"pass@{n}/mean"] = pass_n_mean
+                        metric[f"pass@{n}/std"] = pass_n_std
 
                 var_dict[var_name] = metric
 

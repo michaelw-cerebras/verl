@@ -170,6 +170,92 @@ val-core/openai/gsm8k/acc/best@1/mean: 0.7234
 Key metrics:
 - `val-core/openai/gsm8k/acc/mean@N`: Mean accuracy across N samples
 - `val-core/openai/gsm8k/acc/maj@N/mean`: Majority voting accuracy (if N > 1)
+- `val-core/openai/gsm8k/acc/pass@N/mean`: Pass@N accuracy (if N > 1)
+
+## Understanding Evaluation Metrics (when N > 1)
+
+When you generate multiple responses per prompt (`val_kwargs.n > 1`), VERL computes several different metrics. Understanding the difference is crucial:
+
+### 📊 Metric Comparison
+
+| Metric | What it measures | Example (N=5, 3 correct / 2 wrong) |
+|--------|------------------|-------------------------------------|
+| **`mean@N`** | Average accuracy across all N attempts | (1+1+1+0+0)/5 = **0.60** |
+| **`maj@N`** | Majority voting - take most common answer | 3 > 2 → **1.0** (correct) |
+| **`pass@N`** | Pass@k - at least 1 correct = success | Any correct? → **1.0** |
+| **`best@N`** | Bootstrap max (statistical estimate) | ~0.85 (not the same as pass@k) |
+
+### 🎯 When to Use Each Metric
+
+**1. `mean@N` - Average Performance**
+- **Use for**: Understanding average capability
+- **Interpretation**: "On average, how often does the model get it right?"
+- **Example**: With `n=5`, if mean@5 = 0.60, the model answers correctly 60% of the time
+
+**2. `maj@N` - Majority Voting**
+- **Use for**: Production systems where you can aggregate multiple outputs
+- **Interpretation**: "If I take the most common answer, is it correct?"
+- **Example**: Generate 5 answers, pick the one that appears most often
+- **Good for**: Reducing variance, filtering out random errors
+
+**3. `pass@N` - Boundary Capability** ⭐ **NEW!**
+- **Use for**: Measuring model's potential when given multiple tries
+- **Interpretation**: "Can the model solve this if given N chances?"
+- **Example**: Like a student taking a test N times - passed if they get it right at least once
+- **Good for**:
+  - Evaluating teacher models in GKD (can the teacher even solve this?)
+  - Understanding model's ceiling performance
+  - Filtering dataset difficulty (remove problems where pass@10 = 0)
+
+**4. `best@N` - Bootstrap Maximum**
+- **Use for**: Statistical robustness estimation
+- **Interpretation**: "What's the expected best performance in random sampling?"
+- **Not the same as**: Pass@k (it's a bootstrap estimate, not "at least once correct")
+
+### 💡 Practical Examples
+
+#### Evaluate Teacher Model Boundary Capability
+```bash
+# Can the teacher solve each problem if given 10 tries?
+bash your_train_script.sh \
+    trainer.val_only=true \
+    actor_rollout_ref.model.path=Qwen/Qwen2.5-7B-Instruct \
+    actor_rollout_ref.rollout.val_kwargs.n=10 \
+    actor_rollout_ref.rollout.val_kwargs.temperature=0.8 \
+    actor_rollout_ref.rollout.val_kwargs.do_sample=true
+
+# Check val-core/gsm8k_test/acc/pass@10/mean
+# This tells you what % of problems the teacher can potentially solve
+```
+
+#### Compare Greedy vs Pass@5
+```bash
+# Greedy baseline (n=1)
+bash your_train_script.sh \
+    trainer.val_only=true \
+    actor_rollout_ref.rollout.val_kwargs.n=1 \
+    actor_rollout_ref.rollout.val_kwargs.temperature=0
+
+# Pass@5 (boundary capability)
+bash your_train_script.sh \
+    trainer.val_only=true \
+    actor_rollout_ref.rollout.val_kwargs.n=5 \
+    actor_rollout_ref.rollout.val_kwargs.temperature=0.7
+```
+
+If greedy = 65% and pass@5 = 80%, there's a 15% gap where the model "knows" the answer but doesn't always output it first.
+
+#### Production Deployment with Majority Voting
+```bash
+# Evaluate what accuracy you'd get in production with maj@3
+bash your_train_script.sh \
+    trainer.val_only=true \
+    actor_rollout_ref.rollout.val_kwargs.n=3 \
+    actor_rollout_ref.rollout.val_kwargs.temperature=0.6
+
+# Check val-core/gsm8k_test/acc/maj@3/mean
+# This is your expected production accuracy with 3x inference cost
+```
 
 ## Examples
 
@@ -273,6 +359,8 @@ Make sure validation parameters match:
 ## Tips
 
 1. **For reproducibility**: Always use `temperature=0` and `do_sample=false` (greedy decoding)
-2. **For best accuracy**: Use majority voting with `n=5` or higher
-3. **For debugging**: Use `data.val_max_samples=10` and `trainer.log_val_generations=5`
-4. **For production**: Save outputs with `trainer.validation_data_dir`
+2. **For majority voting**: Use `n=5` or higher with `temperature=0.6-0.8` and `do_sample=true`
+3. **For pass@k evaluation**: Use `n=10` or higher with `temperature=0.7-0.9` to measure boundary capability
+4. **For GKD teacher eval**: Check both `mean@1` (greedy) and `pass@10` (can it solve this at all?)
+5. **For debugging**: Use `data.val_max_samples=10` and `trainer.log_val_generations=5`
+6. **For production**: Save outputs with `trainer.validation_data_dir`
